@@ -1,27 +1,12 @@
 {
   "manifest_version": "0.1.0",
-  "metadata": {
-    "name": "Purple Coding Agent",
-    "description": "An MCTS-guided software engineering agent using Qwen 7B."
-  },
-  "config_schema": {
-    "type": "object",
-    "properties": {
-      "hf_token": {
-        "type": "string",
-        "title": "Hugging Face API Token",
-        "secret": true
-      }
-    },
-    "required": ["hf_token"]
-  },
   "program": {
     "image": "rimodock/purple-coding-agent:latest",
-    "entrypoint": "python src/server.py", // Direct path from /app
+    "entrypoint": "python src/server.py",
     "network": {
       "endpoints": [
         {
-          "name": "a2a_endpoint",
+          "name": "a2a",
           "port": 9010
         }
       ]
@@ -30,14 +15,24 @@
       "LLM_BASE_URL": "https://router.huggingface.co/v1",
       "MODEL_NAME": "Qwen/Qwen2.5-Coder-7B-Instruct",
       "USE_MCTS": "true",
-      "PYTHONPATH": "/app/src", // This ensures 'import agent' still works
       "LLM_API_KEY": "${config.hf_token}"
     }
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "hf_token": {
+        "type": "string",
+        "title": "Hugging Face Token",
+        "secret": true
+      }
+    },
+    "required": ["hf_token"]
   },
   "provides": {
     "a2a": {
       "kind": "a2a",
-      "endpoint": "a2a_endpoint"
+      "endpoint": "a2a"
     }
   },
   "exports": {
