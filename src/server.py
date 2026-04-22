@@ -39,8 +39,9 @@ async def lifespan(app: FastAPI):
     global _agent
     logger.info("🟣 Purple Agent starting up…")
     _agent = PurpleAgent(
-        model_base_url=os.getenv("LLM_BASE_URL", "http://localhost:8000"),
+        model_base_url=os.getenv("LLM_BASE_URL", "https://api-inference.huggingface.co/v1/"),
         model_name=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct"),
+        api_key=os.getenv("LLM_API_KEY", ""), # PULL THE KEY FROM AGENTBEATS
         max_turns=int(os.getenv("MAX_TURNS", "15")),
         mcts_branches=int(os.getenv("MCTS_BRANCHES", "3")),
         temperature=float(os.getenv("TEMPERATURE", "0.6")),
