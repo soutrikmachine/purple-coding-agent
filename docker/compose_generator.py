@@ -20,7 +20,7 @@ services:
       - "9010:9010"
     environment:
       - LLM_BASE_URL=http://vllm:8000
-      - MODEL_NAME=deepseek-ai/Qwen2.5-Coder-7B-Instruct
+      - MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct
       - MAX_TURNS=15
       - MCTS_BRANCHES=3
       - TEMPERATURE=0.6
@@ -44,7 +44,7 @@ services:
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
     command: >
-      --model deepseek-ai/Qwen2.5-Coder-7B-Instruct
+      --model Qwen/Qwen2.5-Coder-7B-Instruct
       --dtype bfloat16
       --max-model-len 8192
       --gpu-memory-utilization 0.85
