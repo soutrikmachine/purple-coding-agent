@@ -52,14 +52,15 @@ class PurpleAgent:
 
     def __init__(
         self,
-        model_base_url: str = "http://localhost:8000",
-        model_name: str = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+        model_base_url: str = "https://api-inference.huggingface.co/v1/",
+        model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+        api_key: str = "", # Added API key parameter
         max_turns: int = 15,
         mcts_branches: int = 3,
         temperature: float = 0.6,
         use_mcts: bool = True,
     ):
-        self.llm = LLMClient(base_url=model_base_url, model=model_name)
+        self.llm = LLMClient(base_url=model_base_url, model=model_name, api_key=api_key)
         self.prm = ProgrammablePRM()
         self.max_turns = max_turns
         self.mcts_branches = mcts_branches
