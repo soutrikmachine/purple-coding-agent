@@ -56,31 +56,34 @@ RUN pip install --no-cache-dir transformers accelerate
 
 # ── Runtime Stage ─────────────────────────────────────────────────────────────
 
-FROM python:3.11-slim AS runtime
+# 1. Use Python 3.11 Slim
+FROM python:3.11-slim
+
+# 2. Install curl (Required for your HEALTHCHECK line to work!)
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
-COPY --from=builder /usr/local/bin /usr/local/bin
+# 3. Add the requirements and install them
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
+# 4. Copy your source code
+# We copy the 'src' folder specifically so the paths match your CMD
 COPY src/ ./src/
 
-# Runtime environment defaults (override at container run time)
+# 5. Environment Variables
 ENV PYTHONPATH=/app/src
 ENV PORT=9010
-ENV LLM_BASE_URL=http://vllm:8000
+ENV LLM_BASE_URL=https://router.huggingface.co/v1
 ENV MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct
-ENV MAX_TURNS=15
-ENV MCTS_BRANCHES=3
-ENV TEMPERATURE=0.6
-ENV USE_MCTS=true
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 9010
 
+# 6. Healthcheck (Now it will work because we installed curl)
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:9010/health || exit 1
 
+# 7. Start the server
 CMD ["python", "src/server.py"]
