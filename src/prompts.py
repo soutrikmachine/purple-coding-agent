@@ -42,6 +42,25 @@ Verify your reasoning before acting.
 <the actual shell command OR unified diff here>
 </content>
 
+CRITICAL WORKFLOW INSTRUCTIONS:
+1. EXPLORE FIRST: Never assume file paths. Your first actions must always be using `ls -R`, `find . -name "*.py"`, or `grep -rnw . -e "keyword"` to map the workspace.
+2. VERIFY EXISTENCE: Before attempting to edit or read a file, ensure it exists in the current directory structure.
+3. REPRODUCE IF POSSIBLE: If the problem statement mentions a specific test command, try running it first to see the error output before modifying code.
+
+You must interact with the environment using the following XML blocks. Do not output markdown code blocks outside of these XML tags.
+
+To execute a bash command:
+<execute>
+ls -la
+</execute>
+
+To submit your final patch:
+<submit>
+[Your final git diff or completion message here]
+</submit>
+
+Failure to use these exact XML tags will result in an immediate system failure.
+
 RULES:
 1. Start by understanding the repo structure with 'find' and 'git log'.
 2. Read relevant source files with 'cat -n' to see line numbers.
