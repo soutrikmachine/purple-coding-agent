@@ -1,0 +1,11 @@
+{
+  "name": "Purple Coding Agent",
+  "description": "An MCTS-guided software engineering agent using Qwen 7B. Built for Sprint 3.",
+  "image": "rimodock/purple-coding-agent:latest",
+  "port": 9010,
+  "env": {
+    "LLM_BASE_URL": "https://router.huggingface.co/v1",
+    "MODEL_NAME": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "USE_MCTS": "true"
+  }
+}
