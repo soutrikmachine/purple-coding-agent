@@ -272,6 +272,15 @@ def train(args):
     )
     logger.info("✅ Model saved to %s/final", args.output)
 
+    # ── NEW: Push to Hugging Face ─────────────────────────────────────────────
+    logger.info("☁️ Pushing merged 16-bit model to Hugging Face Hub...")
+    model.push_to_hub_merged(
+        "whyaisout/purple-deepseek-16b-sprint3", # Use your actual username!
+        tokenizer,
+        save_method="merged_16bit",
+    )
+    logger.info("✅ Successfully pushed to Hugging Face Hub!")
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
