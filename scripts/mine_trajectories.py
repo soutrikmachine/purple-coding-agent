@@ -29,17 +29,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("miner")
 
 
-def load_swebench_tasks(split: str = "verified", max_tasks: int = 60) -> list[dict]:
-    """Load SWE-bench tasks from HuggingFace datasets."""
-    logger.info("Loading SWE-bench %s (max %d tasks)…", split, max_tasks)
+def load_swebench_tasks(split: str = "test", max_tasks: int = 60) -> list[dict]:
+    """Load SWE-bench Pro tasks from HuggingFace datasets."""
+    logger.info("Loading SWE-bench Pro %s (max %d tasks)…", split, max_tasks)
     try:
         from datasets import load_dataset
-        ds = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
+        # Changed from "princeton-nlp/SWE-bench_Verified" to "ScaleAI/SWE-bench_Pro"
+        ds = load_dataset("ScaleAI/SWE-bench_Pro", split=split)
         tasks = list(ds)[:max_tasks]
         logger.info("Loaded %d tasks", len(tasks))
         return tasks
     except Exception as e:
-        logger.error("Could not load SWE-bench: %s", e)
+        logger.error("Could not load SWE-bench Pro: %s", e)
         raise
 
 
