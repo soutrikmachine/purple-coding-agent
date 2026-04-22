@@ -29,13 +29,15 @@ class LLMClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8000",
-        model: str = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+        base_url: str = "https://openrouter.ai/api", # Safer default for standard /v1/ routing
+        model: str = "Qwen/Qwen2.5-Coder-7B-Instruct", # Purged DeepSeek
+        api_key: str = "", # New API Key parameter
         timeout: int = 120,
         max_retries: int = 3,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
         self._local_model = None  # lazy-loaded HF model fallback
@@ -43,7 +45,7 @@ class LLMClient:
         if base_url == "local":
             logger.info("LLM mode: local HuggingFace (Unsloth)")
         else:
-            logger.info("LLM mode: vLLM at %s model=%s", base_url, model)
+            logger.info("LLM mode: API at %s model=%s", base_url, model)
 
     def complete(
         self,
@@ -74,11 +76,17 @@ class LLMClient:
         if stop:
             payload["stop"] = stop
 
+        # Securely inject the API key into the HTTP Headers
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
         url = f"{self.base_url}/v1/chat/completions"
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                resp = requests.post(url, json=payload, timeout=self.timeout)
+                # Pass the headers parameter to the request
+                resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
@@ -143,7 +151,7 @@ class LLMClient:
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.model,
                 max_seq_length=8192,
-                load_in_4bit=True,
+                load_in_4bit=False,  # Disabled to preserve exact mathematical representations
                 dtype=None,  # auto
             )
             FastLanguageModel.for_inference(model)
