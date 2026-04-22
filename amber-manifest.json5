@@ -1,9 +1,9 @@
 {
   "manifest_version": "0.1.0",
-  "name": "Purple Coding Agent",
-  "description": "An MCTS-guided software engineering agent using Qwen 7B.",
-  
-  // 1. Define the network endpoint
+  "metadata": {
+    "name": "Purple Coding Agent",
+    "description": "An MCTS-guided software engineering agent using Qwen 7B."
+  },
   "program": {
     "image": "rimodock/purple-coding-agent:latest",
     "network": {
@@ -20,16 +20,12 @@
       "USE_MCTS": "true"
     }
   },
-
-  // 2. Map the port to the A2A capability
   "provides": {
     "a2a": {
       "kind": "a2a",
       "endpoint": "a2a_endpoint"
     }
   },
-
-  // 3. EXPORT the A2A capability (This fixes your error!)
   "exports": {
     "a2a": "a2a"
   }
