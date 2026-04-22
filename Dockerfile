@@ -39,13 +39,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python dependencies
 COPY pyproject.toml .
+
+# 1. Install PyTorch specifically from the CPU index
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-        fastapi \
-        "uvicorn[standard]" \
-        requests \
-        huggingface-hub \
-        torch --index-url https://download.pytorch.org/whl/cpu
+    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Install all other standard dependencies from the default PyPI index
+RUN pip install --no-cache-dir \
+    fastapi \
+    "uvicorn[standard]" \
+    requests \
+    huggingface-hub
 
 # Transformers (CPU fallback — GPU handled by separate vLLM service)
 RUN pip install --no-cache-dir transformers accelerate
