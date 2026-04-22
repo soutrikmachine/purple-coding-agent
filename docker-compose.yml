@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  purple-agent:
+    build: .
+    ports:
+      - "9010:9010"
+    environment:
+      - LLM_BASE_URL=http://vllm:8000
+      - MODEL_NAME=deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+      - MAX_TURNS=15
+      - MCTS_BRANCHES=3
+      - TEMPERATURE=0.6
+      - USE_MCTS=true
+    depends_on:
+      vllm:
+        condition: service_healthy
+    networks:
+      - agent-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9010/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command: >
+      --model deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+      --dtype bfloat16
+      --max-model-len 8192
+      --gpu-memory-utilization 0.85
+      --quantization bitsandbytes
+      --trust-remote-code
+      --port 8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    networks:
+      - agent-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+networks:
+  agent-net:
+    driver: bridge
+
+volumes:
+  hf_cache:
