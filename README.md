@@ -1,9 +1,9 @@
-# 🟣 Purple Coding Agent — AgentBeats Phase 2
+# 🟣 Phoenix Agent — AgentBeats Phase 2
 
 [![CI](https://github.com/YOUR_USERNAME/purple-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/purple-agent/actions)
 [![AgentBeats](https://img.shields.io/badge/AgentBeats-Phase%202-purple)](https://agentbeats.dev)
 
-An **MCTS-guided software engineering agent** built for the [AgentX–AgentBeats](https://rdi.berkeley.edu/agentx-agentbeats) Phase 2 competition (Coding Agent track). Evaluated against **AgentSWE** (SWE-bench Verified).
+An **MCTS-guided software engineering agent** built for the [AgentX–AgentBeats](https://rdi.berkeley.edu/agentx-agentbeats) Phase 2 competition (Coding Agent track). Evaluated against **AgentSWE** (SWE-bench Pro).
 
 ---
 
@@ -286,7 +286,7 @@ purple-agent/
 
 - **Competition:** [AgentX–AgentBeats Phase 2](https://rdi.berkeley.edu/agentx-agentbeats)
 - **Track:** Coding Agent (Sprint 3, Apr 13 – May 3)
-- **Green Agent:** [AgentSWE](https://agentbeats.dev/soumya-batra/swebench-verified-green-agent) (SWE-bench Verified)
+- **Green Agent:** [AgentSWE](https://agentbeats.dev/agentbeater/swe-bench) (SWE-bench Pro)
 - **Metric:** Resolved Rate (pass@1) + Token Efficiency
 
 ---
