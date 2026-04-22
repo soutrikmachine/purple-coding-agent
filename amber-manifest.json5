@@ -2,7 +2,7 @@
   "manifest_version": "0.1.0",
   "metadata": {
     "name": "Purple Coding Agent",
-    "description": "An MCTS-guided SWE agent using Qwen 7B."
+    "description": "An MCTS-guided software engineering agent using Qwen 7B."
   },
   "config_schema": {
     "type": "object",
@@ -16,9 +16,8 @@
     "required": ["hf_token"]
   },
   "program": {
-    "image": "rimodock/purple-coding-agent:latest", // Updated to match your log!
-    "working_dir": "/app/src", // This moves the "context" into the src folder
-    "entrypoint": "python server.py", // Now we can run it directly
+    "image": "rimodock/purple-coding-agent:latest",
+    "entrypoint": "python src/server.py", // Direct path from /app
     "network": {
       "endpoints": [
         {
@@ -31,6 +30,7 @@
       "LLM_BASE_URL": "https://router.huggingface.co/v1",
       "MODEL_NAME": "Qwen/Qwen2.5-Coder-7B-Instruct",
       "USE_MCTS": "true",
+      "PYTHONPATH": "/app/src", // This ensures 'import agent' still works
       "LLM_API_KEY": "${config.hf_token}"
     }
   },
