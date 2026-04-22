@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-MODEL="${MODEL:-deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct}"
+MODEL="${MODEL:-deepseek-ai/Qwen2.5-Coder-7B-Instruct}"
 PORT="${PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_UTIL="${GPU_UTIL:-0.88}"

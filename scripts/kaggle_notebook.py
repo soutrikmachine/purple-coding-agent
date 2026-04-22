@@ -71,7 +71,7 @@ for i in range(torch.cuda.device_count()):
 
 import subprocess, time, requests
 
-MODEL_ID = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+MODEL_ID = "deepseek-ai/Qwen2.5-Coder-7B-Instruct"
 VLLM_PORT = 8000
 
 proc = subprocess.Popen([

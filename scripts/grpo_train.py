@@ -1,7 +1,7 @@
 """
 GRPO Training Script (Kaggle 2xT4)
 ====================================
-Week 2, Hours 11–15: Fine-tune DeepSeek-Coder-V2-Lite-Instruct on gold
+Week 2, Hours 11–15: Fine-tune Qwen2.5-Coder-7B-Instruct on gold
 trajectories collected in Week 1 using Group Relative Policy Optimization.
 
 Run this in your Kaggle notebook:
@@ -288,7 +288,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="GRPO fine-tuning for Purple Agent")
     p.add_argument("--data", required=True, help="Path to gold_trajectories.jsonl")
     p.add_argument("--output", default="/kaggle/working/grpo_model")
-    p.add_argument("--model", default="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
+    p.add_argument("--model", default="deepseek-ai/Qwen2.5-Coder-7B-Instruct")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--max-seq-len", type=int, default=8192)

@@ -18,13 +18,13 @@
 # Run (with external vLLM):
 #   docker run -p 9010:9010 \
 #     -e LLM_BASE_URL=http://your-vllm-host:8000 \
-#     -e MODEL_NAME=deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \
+#     -e MODEL_NAME=deepseek-ai/Qwen2.5-Coder-7B-Instruct \
 #     purple-agent:latest
 #
 # Run (with local HuggingFace, requires GPU):
 #   docker run --gpus all -p 9010:9010 \
 #     -e LLM_BASE_URL=local \
-#     -e MODEL_NAME=deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \
+#     -e MODEL_NAME=deepseek-ai/Qwen2.5-Coder-7B-Instruct \
 #     purple-agent:latest
 # =============================================================================
 
@@ -67,7 +67,7 @@ COPY src/ ./src/
 ENV PYTHONPATH=/app/src
 ENV PORT=9010
 ENV LLM_BASE_URL=http://vllm:8000
-ENV MODEL_NAME=deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+ENV MODEL_NAME=deepseek-ai/Qwen2.5-Coder-7B-Instruct
 ENV MAX_TURNS=15
 ENV MCTS_BRANCHES=3
 ENV TEMPERATURE=0.6
