@@ -15,7 +15,7 @@
       "LLM_BASE_URL": "https://router.huggingface.co/v1",
       "MODEL_NAME": "Qwen/Qwen2.5-Coder-7B-Instruct",
       "USE_MCTS": "true",
-      "LLM_API_KEY": "${config.hf_token}"
+      "HF_TOKEN": "${config.hf_token}"
     }
   },
   "config_schema": {
