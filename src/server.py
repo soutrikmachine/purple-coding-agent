@@ -83,8 +83,14 @@ AGENT_CARD = {
 }
 
 
-@app.get("/.well-known/agent.json")
+@app.get("/.well-known/agent-card.json")   # ← FIXED: was agent.json
 async def agent_card():
+    return JSONResponse(content=AGENT_CARD)
+ 
+ 
+# Keep the old path too for safety
+@app.get("/.well-known/agent.json")
+async def agent_card_compat():
     return JSONResponse(content=AGENT_CARD)
 
 
