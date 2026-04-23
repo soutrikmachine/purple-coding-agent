@@ -1,67 +1,66 @@
 """
-Purple Agent A2A Server — Fixed for SWE-bench Pro Green Agent
-=============================================================
+Purple Agent — Simplified Single-Shot Server
+=============================================
+Stripped down to the bare minimum for reliability:
+  - One LLM call per task
+  - No MCTS, no sessions, no multi-turn complexity
+  - Returns a patch directly
+  - Heavy logging so GitHub Actions output shows what's happening
 
-Critical fixes applied:
-  1. Agent card served at /.well-known/agent-card.json  (was agent.json)
-  2. Port default changed to 9010                       
-  3. POST /  returns raw patch string as artifact text   (not json.dumps(action))
-  4. Proper task_id / contextId threading through A2A envelope
+If this gets 0 passes, the problem is definitely the LLM API, not the agent logic.
 """
 
-import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 
+import requests
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from agent import PurpleAgent
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("purple_agent.server")
+logger = logging.getLogger("purple_agent")
 
-_agent: PurpleAgent | None = None
+# ── Config from env ───────────────────────────────────────────────────────────
 
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1").rstrip("/")
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct")
+API_KEY      = (
+    os.getenv("HF_TOKEN", "")
+    or os.getenv("LLM_API_KEY", "")
+    or os.getenv("OPENROUTER_API_KEY", "")
+)
+PORT         = int(os.getenv("PORT", "9010"))
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _agent
-    logger.info("🟣 Purple Agent starting…")
-    _agent = PurpleAgent(
-        model_base_url=os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1"),
-        model_name=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct"),
-        hf_token=os.getenv("HF_TOKEN", ""),
-        max_turns=int(os.getenv("MAX_TURNS", "15")),
-        mcts_branches=int(os.getenv("MCTS_BRANCHES", "3")),
-        temperature=float(os.getenv("TEMPERATURE", "0.6")),
-        use_mcts=os.getenv("USE_MCTS", "true").lower() == "true",
-    )
-    logger.info("🟣 Purple Agent ready")
-    yield
+# Build correct URL — avoid double /v1
+if "/v1" in LLM_BASE_URL:
+    CHAT_URL = f"{LLM_BASE_URL}/chat/completions"
+else:
+    CHAT_URL = f"{LLM_BASE_URL}/v1/chat/completions"
 
+logger.info("=" * 60)
+logger.info("Purple Agent starting")
+logger.info("LLM URL   : %s", CHAT_URL)
+logger.info("Model     : %s", MODEL_NAME)
+logger.info("API Key   : %s", "SET ✓" if API_KEY else "MISSING ✗")
+logger.info("Port      : %d", PORT)
+logger.info("=" * 60)
 
-app = FastAPI(title="Purple Coding Agent", lifespan=lifespan)
+# ── FastAPI ───────────────────────────────────────────────────────────────────
 
-# ── Agent Card ─────────────────────────────────────────────────────────────────
-# FIX 1: The SWE-bench green agent calls /.well-known/agent-card.json
-#         NOT /.well-known/agent.json
-# ──────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Purple Coding Agent")
 
 AGENT_CARD = {
     "name": "Purple Coding Agent",
-    "description": (
-        "MCTS-guided autonomous software engineering agent. "
-        "Powered by Qwen2.5-Coder-7B. Explores repositories and returns git patches."
-    ),
-    "url": f"http://localhost:{os.getenv('PORT', '9010')}/",
+    "description": "Autonomous software engineering agent for SWE-bench Pro.",
+    "url": f"http://localhost:{PORT}/",
     "version": "1.0.0",
     "capabilities": {
         "streaming": False,
@@ -73,8 +72,8 @@ AGENT_CARD = {
     "skills": [
         {
             "id": "swe_patch",
-            "name": "Software Engineering Patch",
-            "description": "Fix a GitHub issue by returning a unified git diff patch.",
+            "name": "SWE Patch",
+            "description": "Fix a GitHub issue and return a unified git diff patch.",
             "tags": ["coding", "swe-bench", "patch"],
             "examples": [],
         }
@@ -82,102 +81,151 @@ AGENT_CARD = {
 }
 
 
-@app.get("/.well-known/agent-card.json")   # ← FIXED: was agent.json
+@app.get("/.well-known/agent-card.json")
 async def agent_card():
     return JSONResponse(content=AGENT_CARD)
 
 
-# Keep the old path too for safety
 @app.get("/.well-known/agent.json")
 async def agent_card_compat():
     return JSONResponse(content=AGENT_CARD)
 
 
-# ── A2A Task Handler ───────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 
 @app.post("/")
 async def handle_task(request: Request):
     body = await request.json()
-    logger.info("📨 Received A2A message type=%s", body.get("method", "unknown"))
-
     task_id = body.get("id", str(uuid.uuid4()))
-    message = _extract_message(body)
 
-    if message is None:
-        logger.error("Could not parse task message from body: %s", str(body)[:300])
-        return JSONResponse(
-            status_code=400,
-            content={"id": task_id, "error": {"code": -32600, "message": "Cannot parse task"}},
-        )
+    logger.info("─" * 50)
+    logger.info("Received task id=%s", task_id)
 
-    try:
-        loop = asyncio.get_event_loop()
-        action = await loop.run_in_executor(None, _agent.respond, message)
-    except Exception as e:
-        logger.exception("Agent error: %s", e)
-        action = {"action": "patch", "content": ""}  # return empty patch, don't crash
+    # Extract problem statement from A2A envelope
+    problem_statement = _extract_problem(body)
+    logger.info("Problem statement (first 200 chars): %s", problem_statement[:200])
 
-    # ── FIX 2: Response format ─────────────────────────────────────────────────
-    # The SWE-bench green agent expects the patch as a plain text artifact.
-    # It reads artifacts[0].parts[0].text and uses it as the git diff string.
-    # Do NOT json.dumps(action) — return just the diff content as plain text.
-    # ──────────────────────────────────────────────────────────────────────────
+    if not problem_statement:
+        logger.error("Could not extract problem statement from body")
+        return _make_response(task_id, "")
 
-    patch_content = action.get("content", "") if action.get("action") == "patch" else ""
-    action_type = action.get("action", "bash")
+    # Call LLM
+    patch = _call_llm(problem_statement)
+    logger.info("Patch returned (first 300 chars): %s", patch[:300] if patch else "(empty)")
 
-    if action_type != "patch":
-        # Still in exploration mode — return the bash/debug command
-        # The green agent for SWE-bench Pro sends the result back as a new message
-        artifact_text = json.dumps(action)  # bash/debug actions stay JSON
-    else:
-        artifact_text = patch_content  # patch is returned as raw diff text
+    return _make_response(task_id, patch)
 
-    a2a_response = {
-        "id": task_id,
-        "result": {
-            "id": task_id,
-            "status": {"state": "completed"},
-            "artifacts": [
-                {
-                    "name": "patch" if action_type == "patch" else "action",
-                    "parts": [
-                        {
-                            "type": "text",
-                            "text": artifact_text,
-                        }
-                    ],
-                }
-            ],
-        },
+
+# ── LLM Call ──────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+You are an expert software engineer. You will be given a GitHub issue description.
+Your job is to produce a git unified diff patch that fixes the issue.
+
+Rules:
+- Output ONLY the patch in unified diff format (starting with diff --git)
+- Do not include any explanation or markdown
+- The patch must be valid and directly applicable with `git apply`
+- Make minimal, targeted changes
+"""
+
+def _call_llm(problem_statement: str) -> str:
+    if not API_KEY:
+        logger.error("No API key — skipping LLM call")
+        return ""
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Fix this issue:\n\n{problem_statement}"},
+    ]
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY}",
     }
 
-    logger.info("📤 action=%s content_len=%d", action_type, len(artifact_text))
-    return JSONResponse(content=a2a_response)
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 2048,
+    }
+
+    logger.info("Calling LLM at %s ...", CHAT_URL)
+
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(CHAT_URL, json=payload, headers=headers, timeout=120)
+            logger.info("LLM HTTP status: %d", resp.status_code)
+
+            if resp.status_code == 401:
+                logger.error("401 Unauthorized — API key is wrong or missing")
+                return ""
+
+            if resp.status_code == 429:
+                logger.warning("429 Rate limited — waiting %ds", 5 * attempt)
+                import time; import time as t; t.sleep(5 * attempt)
+                continue
+
+            if resp.status_code != 200:
+                logger.error("LLM error %d: %s", resp.status_code, resp.text[:300])
+                return ""
+
+            data = resp.json()
+            raw = data["choices"][0]["message"]["content"]
+            logger.info("LLM raw response length: %d chars", len(raw))
+
+            # Extract patch from response
+            patch = _extract_patch(raw)
+            logger.info("Extracted patch length: %d chars", len(patch))
+            return patch
+
+        except Exception as e:
+            logger.warning("LLM attempt %d failed: %s", attempt, e)
+            import time; time.sleep(2 ** attempt)
+
+    logger.error("All LLM attempts failed")
+    return ""
 
 
-def _extract_message(body: dict) -> dict | None:
-    """
-    Parse the A2A envelope from the SWE-bench green agent.
+def _extract_patch(raw: str) -> str:
+    """Extract unified diff from LLM response."""
+    raw = raw.strip()
 
-    The green agent sends:
-      {
-        "id": "...",
-        "method": "message/send",
-        "params": {
-          "message": {
-            "role": "user",
-            "parts": [{"type": "text", "text": "<JSON string of task>"}]
-          },
-          "metadata": {...}
-        }
-      }
-    """
-    # Direct: green agent embeds task data at top level
+    # Strip markdown code fences if present
+    if "```" in raw:
+        # Try to extract content between fences
+        match = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
+        if match:
+            raw = match.group(1).strip()
+
+    # Check if it looks like a patch
+    if raw.startswith("diff --git") or raw.startswith("--- "):
+        return raw
+
+    # Try to find a diff block anywhere in the response
+    diff_match = re.search(r"(diff --git.*)", raw, re.DOTALL)
+    if diff_match:
+        return diff_match.group(1).strip()
+
+    logger.warning("LLM response does not contain a recognizable diff")
+    logger.info("Raw LLM output: %s", raw[:500])
+    return raw  # return as-is and let the green agent handle it
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _extract_problem(body: dict) -> str:
+    """Extract problem statement from A2A message envelope."""
+
+    # Direct field
     if "problem_statement" in body:
-        return body
+        return body["problem_statement"]
 
-    # A2A spec format: params.message.parts[].text
+    # A2A spec: params.message.parts[].text
     try:
         parts = body["params"]["message"]["parts"]
         for part in parts:
@@ -186,35 +234,40 @@ def _extract_message(body: dict) -> dict | None:
                 try:
                     parsed = json.loads(text)
                     if isinstance(parsed, dict):
-                        return parsed
+                        return parsed.get("problem_statement", text)
                 except (json.JSONDecodeError, ValueError):
-                    return {"problem_statement": text}
+                    return text
     except (KeyError, TypeError):
         pass
 
-    # Fallback: look for any nested dict with problem_statement
+    # Fallback: search nested dicts
     for key in ("message", "data", "input", "task", "params"):
         val = body.get(key)
-        if isinstance(val, dict) and "problem_statement" in val:
-            return val
+        if isinstance(val, dict):
+            if "problem_statement" in val:
+                return val["problem_statement"]
 
-    # Last resort: return the whole body if it might contain useful fields
-    if any(k in body for k in ("repo", "instance_id", "base_commit")):
-        return body
-
-    logger.warning("Cannot extract message from body keys: %s", list(body.keys()))
-    return None
+    logger.warning("Could not find problem_statement in keys: %s", list(body.keys()))
+    return ""
 
 
-# ── Health ─────────────────────────────────────────────────────────────────────
+def _make_response(task_id: str, patch: str) -> JSONResponse:
+    return JSONResponse(content={
+        "id": task_id,
+        "result": {
+            "id": task_id,
+            "status": {"state": "completed"},
+            "artifacts": [
+                {
+                    "name": "patch",
+                    "parts": [{"type": "text", "text": patch}],
+                }
+            ],
+        },
+    })
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "agent": "purple-coding-agent"}
 
-
-# ── Entry Point ────────────────────────────────────────────────────────────────
+# ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "9010"))   # ← FIX 3: default 9009 not 9010
-    uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT, log_level="info")
