@@ -29,7 +29,7 @@ class LLMClient:
 
     def __init__(
         self,
-        base_url: str = "https://openrouter.ai/api", # Safer default for standard /v1/ routing
+        base_url: str = "https://openrouter.ai/api/v1", # Safer default for standard /v1/ routing
         model: str = "Qwen/Qwen2.5-Coder-7B-Instruct", # Purged DeepSeek
         api_key: str = "", # New API Key parameter
         timeout: int = 120,
