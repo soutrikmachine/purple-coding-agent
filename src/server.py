@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     global _agent
     logger.info("🟣 Purple Agent starting…")
     _agent = PurpleAgent(
-        model_base_url=os.getenv("LLM_BASE_URL", "https://api-inference.huggingface.co/v1"),
+        model_base_url=os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1"),
         model_name=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct"),
         hf_token=os.getenv("HF_TOKEN", ""),
         max_turns=int(os.getenv("MAX_TURNS", "15")),
@@ -61,7 +61,7 @@ AGENT_CARD = {
         "MCTS-guided autonomous software engineering agent. "
         "Powered by Qwen2.5-Coder-7B. Explores repositories and returns git patches."
     ),
-    "url": f"http://localhost:{os.getenv('PORT', '9009')}/",
+    "url": f"http://localhost:{os.getenv('PORT', '9010')}/",
     "version": "1.0.0",
     "capabilities": {
         "streaming": False,
