@@ -4,7 +4,7 @@ Purple Agent A2A Server — Fixed for SWE-bench Pro Green Agent
 
 Critical fixes applied:
   1. Agent card served at /.well-known/agent-card.json  (was agent.json)
-  2. Port default changed to 9009                        (was 9010)
+  2. Port default changed to 9010                       
   3. POST /  returns raw patch string as artifact text   (not json.dumps(action))
   4. Proper task_id / contextId threading through A2A envelope
 """
@@ -216,5 +216,5 @@ async def health():
 # ── Entry Point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "9009"))   # ← FIX 3: default 9009 not 9010
+    port = int(os.getenv("PORT", "9010"))   # ← FIX 3: default 9009 not 9010
     uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
