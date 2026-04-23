@@ -1,12 +1,12 @@
 """
-Purple Agent A2A Server
-=======================
-FastAPI server implementing the A2A (Agent-to-Agent) protocol.
-The green agent (AgentSWE/SWE-bench) sends tasks here; we return actions.
+Purple Agent A2A Server — Fixed for SWE-bench Pro Green Agent
+=============================================================
 
-Protocol:
-  GET  /.well-known/agent.json  -> Agent Card
-  POST /                        -> Handle A2A task messages
+Critical fixes applied:
+  1. Agent card served at /.well-known/agent-card.json  (was agent.json)
+  2. Port default changed to 9009                        (was 9010)
+  3. POST /  returns raw patch string as artifact text   (not json.dumps(action))
+  4. Proper task_id / contextId threading through A2A envelope
 """
 
 import asyncio
@@ -15,7 +15,6 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -29,19 +28,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("purple_agent.server")
 
-# ── Globals ──────────────────────────────────────────────────────────────────
-
 _agent: PurpleAgent | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _agent
-    logger.info("🟣 Purple Agent starting up…")
+    logger.info("🟣 Purple Agent starting…")
     _agent = PurpleAgent(
-        model_base_url=os.getenv("LLM_BASE_URL", "https://api-inference.huggingface.co/v1/"),
+        model_base_url=os.getenv("LLM_BASE_URL", "https://api-inference.huggingface.co/v1"),
         model_name=os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct"),
-        api_key=os.getenv("LLM_API_KEY", ""), # PULL THE KEY FROM AGENTBEATS
+        hf_token=os.getenv("HF_TOKEN", ""),
         max_turns=int(os.getenv("MAX_TURNS", "15")),
         mcts_branches=int(os.getenv("MCTS_BRANCHES", "3")),
         temperature=float(os.getenv("TEMPERATURE", "0.6")),
@@ -49,20 +46,22 @@ async def lifespan(app: FastAPI):
     )
     logger.info("🟣 Purple Agent ready")
     yield
-    logger.info("🟣 Purple Agent shutting down")
 
 
 app = FastAPI(title="Purple Coding Agent", lifespan=lifespan)
 
-# ── Agent Card ────────────────────────────────────────────────────────────────
+# ── Agent Card ─────────────────────────────────────────────────────────────────
+# FIX 1: The SWE-bench green agent calls /.well-known/agent-card.json
+#         NOT /.well-known/agent.json
+# ──────────────────────────────────────────────────────────────────────────────
 
 AGENT_CARD = {
     "name": "Purple Coding Agent",
     "description": (
-        "An MCTS-guided software engineering agent that explores repositories "
-        "and patches bugs using Qwen reasoning. "
-        "Built for SWE-bench / AgentBeats Phase 2."
+        "MCTS-guided autonomous software engineering agent. "
+        "Powered by Qwen2.5-Coder-7B. Explores repositories and returns git patches."
     ),
+    "url": f"http://localhost:{os.getenv('PORT', '9009')}/",
     "version": "1.0.0",
     "capabilities": {
         "streaming": False,
@@ -75,8 +74,8 @@ AGENT_CARD = {
         {
             "id": "swe_patch",
             "name": "Software Engineering Patch",
-            "description": "Explore a codebase and produce a git patch to fix a bug.",
-            "tags": ["coding", "debugging", "patch", "swe-bench"],
+            "description": "Fix a GitHub issue by returning a unified git diff patch.",
+            "tags": ["coding", "swe-bench", "patch"],
             "examples": [],
         }
     ],
@@ -86,95 +85,136 @@ AGENT_CARD = {
 @app.get("/.well-known/agent-card.json")   # ← FIXED: was agent.json
 async def agent_card():
     return JSONResponse(content=AGENT_CARD)
- 
- 
+
+
 # Keep the old path too for safety
 @app.get("/.well-known/agent.json")
 async def agent_card_compat():
     return JSONResponse(content=AGENT_CARD)
 
 
-# ── A2A Task Handler ──────────────────────────────────────────────────────────
+# ── A2A Task Handler ───────────────────────────────────────────────────────────
 
 @app.post("/")
 async def handle_task(request: Request):
-    """
-    Main A2A endpoint. The green agent sends a JSON body following the A2A spec.
-    We run our MCTS+LLM loop and return the action response.
-    """
     body = await request.json()
-    logger.info("📨 Received A2A message: %s", json.dumps(body)[:300])
+    logger.info("📨 Received A2A message type=%s", body.get("method", "unknown"))
 
     task_id = body.get("id", str(uuid.uuid4()))
     message = _extract_message(body)
 
     if message is None:
+        logger.error("Could not parse task message from body: %s", str(body)[:300])
         return JSONResponse(
             status_code=400,
-            content={"error": "Could not parse task message"},
+            content={"id": task_id, "error": {"code": -32600, "message": "Cannot parse task"}},
         )
 
-    # Run agent (async-safe wrapper around sync reasoning loop)
-    loop = asyncio.get_event_loop()
-    response_action = await loop.run_in_executor(None, _agent.respond, message)
+    try:
+        loop = asyncio.get_event_loop()
+        action = await loop.run_in_executor(None, _agent.respond, message)
+    except Exception as e:
+        logger.exception("Agent error: %s", e)
+        action = {"action": "patch", "content": ""}  # return empty patch, don't crash
 
-    # Wrap in A2A response envelope
+    # ── FIX 2: Response format ─────────────────────────────────────────────────
+    # The SWE-bench green agent expects the patch as a plain text artifact.
+    # It reads artifacts[0].parts[0].text and uses it as the git diff string.
+    # Do NOT json.dumps(action) — return just the diff content as plain text.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    patch_content = action.get("content", "") if action.get("action") == "patch" else ""
+    action_type = action.get("action", "bash")
+
+    if action_type != "patch":
+        # Still in exploration mode — return the bash/debug command
+        # The green agent for SWE-bench Pro sends the result back as a new message
+        artifact_text = json.dumps(action)  # bash/debug actions stay JSON
+    else:
+        artifact_text = patch_content  # patch is returned as raw diff text
+
     a2a_response = {
         "id": task_id,
         "result": {
+            "id": task_id,
             "status": {"state": "completed"},
             "artifacts": [
                 {
-                    "name": "action",
-                    "parts": [{"type": "text", "text": json.dumps(response_action)}],
+                    "name": "patch" if action_type == "patch" else "action",
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": artifact_text,
+                        }
+                    ],
                 }
             ],
         },
     }
-    logger.info("📤 Sending action: %s", json.dumps(response_action)[:200])
+
+    logger.info("📤 action=%s content_len=%d", action_type, len(artifact_text))
     return JSONResponse(content=a2a_response)
 
 
 def _extract_message(body: dict) -> dict | None:
     """
-    Parse A2A envelope to get the actual task payload.
-    Handles both direct message format and nested params/message format.
+    Parse the A2A envelope from the SWE-bench green agent.
+
+    The green agent sends:
+      {
+        "id": "...",
+        "method": "message/send",
+        "params": {
+          "message": {
+            "role": "user",
+            "parts": [{"type": "text", "text": "<JSON string of task>"}]
+          },
+          "metadata": {...}
+        }
+      }
     """
-    # Direct task data (green agent may send flat JSON)
+    # Direct: green agent embeds task data at top level
     if "problem_statement" in body:
         return body
 
-    # A2A spec: params -> message -> parts
+    # A2A spec format: params.message.parts[].text
     try:
         parts = body["params"]["message"]["parts"]
         for part in parts:
             if part.get("type") == "text":
                 text = part["text"]
                 try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except (json.JSONDecodeError, ValueError):
                     return {"problem_statement": text}
     except (KeyError, TypeError):
         pass
 
-    # Fallback: try to find any dict with problem_statement
-    for key in ("message", "data", "input", "task"):
-        if key in body and isinstance(body[key], dict):
-            if "problem_statement" in body[key]:
-                return body[key]
+    # Fallback: look for any nested dict with problem_statement
+    for key in ("message", "data", "input", "task", "params"):
+        val = body.get(key)
+        if isinstance(val, dict) and "problem_statement" in val:
+            return val
 
+    # Last resort: return the whole body if it might contain useful fields
+    if any(k in body for k in ("repo", "instance_id", "base_commit")):
+        return body
+
+    logger.warning("Cannot extract message from body keys: %s", list(body.keys()))
     return None
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "agent": "purple"}
+    return {"status": "ok", "agent": "purple-coding-agent"}
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# ── Entry Point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "9010"))
+    port = int(os.getenv("PORT", "9009"))   # ← FIX 3: default 9009 not 9010
     uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
