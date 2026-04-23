@@ -1,10 +1,13 @@
 """
 LLMClient
 =========
-Thin wrapper around OpenAI-compatible API (served by vLLM on Kaggle)
-with a fallback to HuggingFace Transformers for offline use.
+Thin wrapper around OpenAI-compatible API.
+Supports HuggingFace Router, OpenRouter, or any vLLM-served endpoint.
 
-vLLM server is started separately (see scripts/start_vllm.sh).
+Fixes applied:
+  1. No double /v1 in URL — base_url already contains /v1
+  2. Token read from env vars as fallback (HF_TOKEN or LLM_API_KEY)
+  3. Returns empty string on failure instead of crashing
 """
 
 from __future__ import annotations
@@ -18,34 +21,48 @@ import requests
 
 logger = logging.getLogger("purple_agent.llm")
 
-# ── OpenAI-Compatible Client ──────────────────────────────────────────────────
-
 
 class LLMClient:
     """
-    Calls a vLLM-served OpenAI-compatible /v1/chat/completions endpoint.
-    Falls back to direct HuggingFace inference if base_url is "local".
+    Calls an OpenAI-compatible /chat/completions endpoint.
+    Works with HuggingFace Router, OpenRouter, or vLLM.
     """
 
     def __init__(
         self,
-        base_url: str = "https://router.huggingface.co/v1", # Safer default for standard /v1/ routing
-        model: str = "Qwen/Qwen2.5-Coder-7B-Instruct", # Purged DeepSeek
-        api_key: str = "", # New API Key parameter
+        base_url: str = "https://router.huggingface.co/v1",
+        model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+        api_key: str = "",
         timeout: int = 120,
         max_retries: int = 3,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
-        self._local_model = None  # lazy-loaded HF model fallback
+        self._local_model = None
 
-        if base_url == "local":
-            logger.info("LLM mode: local HuggingFace (Unsloth)")
+        # FIX 2: read token from argument first, then fall back to env vars
+        self.api_key = (
+            api_key
+            or os.getenv("HF_TOKEN", "")
+            or os.getenv("LLM_API_KEY", "")
+            or os.getenv("OPENROUTER_API_KEY", "")
+        )
+
+        if self.api_key:
+            logger.info("LLM auth token set ✓")
         else:
-            logger.info("LLM mode: API at %s model=%s", base_url, model)
+            logger.warning("No API token found — LLM calls will fail with 401")
+
+        # FIX 1: build the correct chat completions URL once
+        # base_url may or may not end in /v1 — handle both cases
+        if self.base_url.endswith("/v1"):
+            self._chat_url = f"{self.base_url}/chat/completions"
+        else:
+            self._chat_url = f"{self.base_url}/v1/chat/completions"
+
+        logger.info("LLM endpoint: %s  model: %s", self._chat_url, self.model)
 
     def complete(
         self,
@@ -76,17 +93,31 @@ class LLMClient:
         if stop:
             payload["stop"] = stop
 
-        # Securely inject the API key into the HTTP Headers
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        url = f"{self.base_url}/v1/chat/completions"
-
         for attempt in range(1, self.max_retries + 1):
             try:
-                # Pass the headers parameter to the request
-                resp = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+                resp = requests.post(
+                    self._chat_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+
+                if resp.status_code == 401:
+                    logger.error(
+                        "LLM returned 401 Unauthorized. "
+                        "Check that HF_TOKEN is set correctly in amber-manifest.json5 secrets."
+                    )
+                    return ""
+
+                if resp.status_code == 429:
+                    logger.warning("LLM rate limited (429). Waiting before retry...")
+                    time.sleep(5 * attempt)
+                    continue
+
                 resp.raise_for_status()
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
@@ -97,14 +128,18 @@ class LLMClient:
                     usage.get("completion_tokens", 0),
                 )
                 return content
-            except requests.RequestException as e:
-                logger.warning("LLM call attempt %d failed: %s", attempt, e)
-                if attempt < self.max_retries:
-                    time.sleep(2**attempt)
-                else:
-                    raise RuntimeError(f"LLM call failed after {self.max_retries} attempts") from e
 
-        return ""  # unreachable
+            except requests.RequestException as e:
+                logger.warning("LLM attempt %d/%d failed: %s", attempt, self.max_retries, e)
+                if attempt < self.max_retries:
+                    time.sleep(2 ** attempt)
+                else:
+                    # FIX 3: return empty string instead of raising — agent will
+                    # return empty patch, task scores 0 but container doesn't crash
+                    logger.error("All LLM retries exhausted, returning empty string")
+                    return ""
+
+        return ""
 
     # ── Local HuggingFace Fallback ────────────────────────────────────────────
 
@@ -115,15 +150,14 @@ class LLMClient:
         max_tokens: int,
     ) -> str:
         """
-        Direct inference using Unsloth-loaded model.
-        Used inside the Kaggle notebook when vLLM isn't running.
+        Direct inference using locally loaded model.
+        Only used when LLM_BASE_URL=local.
         """
         if self._local_model is None:
             self._load_local_model()
 
         model, tokenizer = self._local_model
 
-        # Apply chat template
         text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -145,14 +179,14 @@ class LLMClient:
         return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     def _load_local_model(self):
-        logger.info("Loading local model with Unsloth…")
+        logger.info("Loading local model...")
         try:
             from unsloth import FastLanguageModel
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.model,
                 max_seq_length=8192,
-                load_in_4bit=False,  # Disabled to preserve exact mathematical representations
-                dtype=None,  # auto
+                load_in_4bit=True,
+                dtype=None,
             )
             FastLanguageModel.for_inference(model)
         except ImportError:
