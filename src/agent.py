@@ -41,7 +41,7 @@ class SWETask:
 class PurpleAgent:
     def __init__(
         self,
-        model_base_url: str = "https://openrouter.ai/api/v1",
+        model_base_url: str = "https://router.huggingface.co/v1",
         model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
         hf_token: str = "",
         max_turns: int = 15,
