@@ -71,7 +71,7 @@ for i in range(torch.cuda.device_count()):
 
 import subprocess, time, requests
 
-MODEL_ID = "Qwen/Qwen2.5-Coder-7B-Instruct"
+MODEL_ID = "google/gemma-4-26B-A4B-it:novita"
 VLLM_PORT = 8000
 
 proc = subprocess.Popen([

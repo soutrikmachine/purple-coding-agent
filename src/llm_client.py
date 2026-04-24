@@ -31,7 +31,7 @@ class LLMClient:
     def __init__(
         self,
         base_url: str = "https://router.huggingface.co/v1",
-        model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+        model: str = "google/gemma-4-26B-A4B-it:novita",
         api_key: str = "",
         timeout: int = 120,
         max_retries: int = 3,

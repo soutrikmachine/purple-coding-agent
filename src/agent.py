@@ -42,7 +42,7 @@ class PurpleAgent:
     def __init__(
         self,
         model_base_url: str = "https://router.huggingface.co/v1",
-        model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+        model_name: str = "google/gemma-4-26B-A4B-it:novita",
         hf_token: str = "",
         max_turns: int = 15,
         mcts_branches: int = 3,

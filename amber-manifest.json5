@@ -13,7 +13,7 @@
     },
     "env": {
       "LLM_BASE_URL": "https://router.huggingface.co/v1",
-      "MODEL_NAME": "Qwen/Qwen2.5-Coder-7B-Instruct",
+      "MODEL_NAME": "google/gemma-4-26B-A4B-it:novita",
       "USE_MCTS": "true",
       "HF_TOKEN": "${config.hf_token}"
     }

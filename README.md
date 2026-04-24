@@ -28,7 +28,7 @@ An **MCTS-guided software engineering agent** built for the [AgentX–AgentBeats
                                ▼
                   ┌────────────────────────┐
                   │   vLLM / Unsloth       │
-                  │  Qwen2.5-Coder (7B)   │
+                  │  Gemma-4-26B (A4B)   │
                   └────────────────────────┘
 ```
 
@@ -192,7 +192,7 @@ docker push ghcr.io/YOUR_USERNAME/purple-agent:latest
 | Variable | Default | Description |
 |---|---|---|
 | `LLM_BASE_URL` | `http://vllm:8000` | vLLM/OpenAI-compatible endpoint |
-| `MODEL_NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Model ID |
+| `MODEL_NAME` | `google/gemma-4-26B-A4B-it:novita` | Model ID |
 | `MAX_TURNS` | `15` | Max turns per task |
 | `MCTS_BRANCHES` | `3` | Candidate actions per MCTS step |
 | `TEMPERATURE` | `0.6` | LLM sampling temperature |
@@ -239,7 +239,7 @@ Fine-tuning uses **Unsloth's MoE Triton Kernels** for 7× speed and 35% less VRA
 
 ```python
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="Qwen/Qwen2.5-Coder-7B-Instruct",
+    model_name="google/gemma-4-26B-A4B-it:novita",
     max_seq_length=8192,
     load_in_4bit=True,
 )
