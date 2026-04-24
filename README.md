@@ -28,8 +28,7 @@ An **MCTS-guided software engineering agent** built for the [AgentX–AgentBeats
                                ▼
                   ┌────────────────────────┐
                   │   vLLM / Unsloth       │
-                  │  DeepSeek-Coder-V2     │
-                  │  Lite Instruct (16B)   │
+                  │  Qwen2.5-Coder (7B)   │
                   └────────────────────────┘
 ```
 
