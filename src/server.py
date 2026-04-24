@@ -435,8 +435,8 @@ class PurpleAgent:
 
     def respond(self, message: dict) -> dict:
         session_id = (
-            message.get("instance_id")
-            or message.get("session_id")
+            message.get("session_id")
+            or message.get("instance_id")
             or str(abs(hash(message.get("problem_statement", "")[:80])))
         )
 
@@ -485,21 +485,36 @@ class PurpleAgent:
         session["turn"] += 1
         turn = session["turn"]
 
-        # SWE-bench green agent is SINGLE-TURN — go straight to patch
-        # MCTS is used to sample N candidate patches and pick the best one
-        logger.info("[%s] turn=%d — generating patch directly", session["id"], turn)
+        # Record observation from green agent
+        if "stdout" in message or "stderr" in message:
+            obs = {
+                "cwd":    message.get("cwd", task.cwd),
+                "stdout": message.get("stdout", ""),
+                "stderr": message.get("stderr", ""),
+            }
+            if session["history"]:
+                session["history"][-1]["observation"] = obs
+                score = self.prm.score_observation(obs, task)
+                session["mcts"].backpropagate(score)
+                logger.info("[%s] turn=%d PRM=%.3f", session["id"], turn, score)
 
-        if USE_MCTS:
-           action = self._mcts_patch(session)
+                # Update node state from observation
+                self._update_state(session["node_state"], obs)
+
+        # Force patch when nearing turn limit
+        if turn >= MAX_TURNS - 1 and not session["submitted_patch"]:
+            logger.info("[%s] Forcing patch (turn limit)", session["id"])
+            return self._force_patch(session)
+
+        # Select action
+        if USE_MCTS and turn > 1:
+            action = self._mcts_action(session)
         else:
-           action = self._greedy_patch(session)
+            action = self._greedy_action(session)
 
         session["history"].append({"action": action})
-        logger.info("[%s] action=%s patch_len=%d",
-                    session["id"], action.get("action"), len(action.get("content", "")))
+        logger.info("[%s] turn=%d action=%s", session["id"], turn, action.get("action"))
         return action
-
-        
 
     # ── Action Selection ──────────────────────────────────────────────────────
 
@@ -521,74 +536,6 @@ class PurpleAgent:
         best, _ = session["mcts"].select_action(candidates)
         logger.info("MCTS stats: %s", session["mcts"].stats())
         return best
-
-    def _greedy_patch(self, session: dict) -> dict:
-        """Single-shot patch generation."""
-        msgs = self._build_patch_messages(session)
-        raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
-        return self._force_to_patch(raw, session)
-
-    def _mcts_patch(self, session: dict) -> dict:
-        """
-        MCTS over patch candidates — sample MCTS_BRANCHES patches,
-        score each with static PRM, return highest scoring one.
-        This is inference-time scaling: more branches = better patch selection.
-        """
-        msgs       = self._build_patch_messages(session)
-        candidates = []
-        for i in range(MCTS_BRANCHES):
-            raw    = self.llm.complete(msgs, temperature=0.3 + i * 0.15, max_tokens=2048)
-            action = self._force_to_patch(raw, session)
-            score  = self.prm.score_static(action, session["task"])
-            candidates.append((action, score))
-            logger.info("[%s] MCTS branch %d/%d score=%.3f patch_len=%d",
-                        session["id"], i+1, MCTS_BRANCHES, score, len(action.get("content","")))
-
-        # UCT select best
-        best_action, best_score = max(candidates, key=lambda x: x[1])
-        logger.info("[%s] MCTS selected branch score=%.3f", session["id"], best_score)
-        session["mcts"].backpropagate(best_score)
-        return best_action
-
-    def _build_patch_messages(self, session: dict) -> list[dict]:
-        """Prompt specifically for patch generation (not exploration)."""
-        task = session["task"]
-        system = """\
-You are an expert software engineer. Given a GitHub issue, produce a git unified diff patch.
-
-RULES:
-- Output ONLY the patch starting with: diff --git
-- No explanation, no markdown fences, no commentary
-- Make minimal targeted changes
-- Patch must be valid and applicable with `git apply`
-"""
-        user = f"Fix this issue:\n\n{task.problem_statement[:3500]}"
-        if task.hints_text:
-            user += f"\n\nHints:\n{task.hints_text}"
-        if task.fail_to_pass:
-            user += "\n\nTests that must pass:\n" + "\n".join(f"- {t}" for t in task.fail_to_pass)
-        return [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ]
-
-    def _force_to_patch(self, raw: str, session: dict) -> dict:
-        """Parse LLM output and force it into patch format."""
-        raw = raw.strip()
-        # Strip markdown fences
-        if "```" in raw:
-            m = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
-            if m:
-                raw = m.group(1).strip()
-        # Find diff block
-        if not (raw.startswith("diff --git") or raw.startswith("--- ")):
-            m = re.search(r"(diff --git.*)", raw, re.DOTALL)
-            raw = m.group(1).strip() if m else ""
-        if raw:
-            logger.info("[%s] Valid patch extracted (%d chars)", session["id"], len(raw))
-        else:
-            logger.warning("[%s] No valid diff found in LLM output", session["id"])
-        return {"action": "patch", "content": raw}
 
     def _force_patch(self, session: dict) -> dict:
         task    = session["task"]
@@ -750,34 +697,25 @@ async def handle_task(request: Request):
     task_id     = str(uuid.uuid4())
     artifact_id = str(uuid.uuid4())
 
-    logger.info("─" * 50)
-    logger.info("Request id=%s method=%s", jsonrpc_id, body.get("method"))
-
-    # ── Extract task from JSON-RPC envelope ───────────────────────────────────
     task_data, context_id = _extract_task_and_context(body)
     if not context_id:
         context_id = str(uuid.uuid4())
 
+    # KEY FIX: use contextId as session key — it persists across ALL turns
+    # instance_id is only in turn 1, contextId is in every turn
+    task_data["session_id"] = context_id
+
     ps = task_data.get("problem_statement", "")
-    logger.info("problem_statement (%d chars): %s", len(ps), ps[:200])
+    logger.info("context_id=%s ps_len=%d", context_id, len(ps))
 
-    if not ps:
-        logger.error("Empty problem_statement — returning empty patch")
-
-    # ── Run MCTS agent ────────────────────────────────────────────────────────
     action = agent.respond(task_data)
-    patch  = action.get("content", "") if action.get("action") == "patch" else ""
 
-    # For bash/debug actions, return as JSON in the artifact text
-    # For patch actions, return the raw diff
+    # Return bash/debug actions as JSON, patch as raw diff
     if action.get("action") == "patch":
-        artifact_text = patch
+        artifact_text = action.get("content", "")
     else:
         artifact_text = json.dumps(action)
 
-    logger.info("Returning action=%s artifact_len=%d", action.get("action"), len(artifact_text))
-
-    # ── A2A compliant response ────────────────────────────────────────────────
     response = {
         "jsonrpc": "2.0",
         "id": jsonrpc_id,
@@ -789,17 +727,11 @@ async def handle_task(request: Request):
                 {
                     "artifactId": artifact_id,
                     "name": "patch",
-                    "parts": [
-                        {
-                            "kind": "text",
-                            "text": artifact_text,
-                        }
-                    ],
+                    "parts": [{"kind": "text", "text": artifact_text}],
                 }
             ],
         },
     }
-
     return JSONResponse(content=response)
 
 
