@@ -545,71 +545,71 @@ class PurpleAgent:
 
     def _greedy_patch(self, session: dict) -> dict:
     """Single-shot patch generation."""
-    msgs = self._build_patch_messages(session)
-    raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
-    return self._force_to_patch(raw, session)
+       msgs = self._build_patch_messages(session)
+       raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
+       return self._force_to_patch(raw, session)
 
-def _mcts_patch(self, session: dict) -> dict:
-    """
-    MCTS over patch candidates — sample MCTS_BRANCHES patches,
-    score each with static PRM, return highest scoring one.
-    This is inference-time scaling: more branches = better patch selection.
-    """
-    msgs       = self._build_patch_messages(session)
-    candidates = []
-    for i in range(MCTS_BRANCHES):
-        raw    = self.llm.complete(msgs, temperature=0.3 + i * 0.15, max_tokens=2048)
-        action = self._force_to_patch(raw, session)
-        score  = self.prm.score_static(action, session["task"])
-        candidates.append((action, score))
-        logger.info("[%s] MCTS branch %d/%d score=%.3f patch_len=%d",
-                    session["id"], i+1, MCTS_BRANCHES, score, len(action.get("content","")))
+    def _mcts_patch(self, session: dict) -> dict:
+       """
+       MCTS over patch candidates — sample MCTS_BRANCHES patches,
+       score each with static PRM, return highest scoring one.
+       This is inference-time scaling: more branches = better patch selection.
+       """
+        msgs       = self._build_patch_messages(session)
+        candidates = []
+        for i in range(MCTS_BRANCHES):
+            raw    = self.llm.complete(msgs, temperature=0.3 + i * 0.15, max_tokens=2048)
+            action = self._force_to_patch(raw, session)
+            score  = self.prm.score_static(action, session["task"])
+            candidates.append((action, score))
+            logger.info("[%s] MCTS branch %d/%d score=%.3f patch_len=%d",
+                       session["id"], i+1, MCTS_BRANCHES, score, len(action.get("content","")))
 
-    # UCT select best
-    best_action, best_score = max(candidates, key=lambda x: x[1])
-    logger.info("[%s] MCTS selected branch score=%.3f", session["id"], best_score)
-    session["mcts"].backpropagate(best_score)
-    return best_action
+        # UCT select best
+        best_action, best_score = max(candidates, key=lambda x: x[1])
+        logger.info("[%s] MCTS selected branch score=%.3f", session["id"], best_score)
+        session["mcts"].backpropagate(best_score)
+        return best_action
 
-def _build_patch_messages(self, session: dict) -> list[dict]:
-    """Prompt specifically for patch generation (not exploration)."""
-    task = session["task"]
-    system = """\
-You are an expert software engineer. Given a GitHub issue, produce a git unified diff patch.
+    def _build_patch_messages(self, session: dict) -> list[dict]:
+        """Prompt specifically for patch generation (not exploration)."""
+        task = session["task"]
+        system = """\
+        You are an expert software engineer. Given a GitHub issue, produce a git unified diff patch.
 
-RULES:
-- Output ONLY the patch starting with: diff --git
-- No explanation, no markdown fences, no commentary
-- Make minimal targeted changes
-- Patch must be valid and applicable with `git apply`
-"""
-    user = f"Fix this issue:\n\n{task.problem_statement[:3500]}"
-    if task.hints_text:
-        user += f"\n\nHints:\n{task.hints_text}"
-    if task.fail_to_pass:
-        user += "\n\nTests that must pass:\n" + "\n".join(f"- {t}" for t in task.fail_to_pass)
-    return [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user},
-    ]
+        RULES:
+        - Output ONLY the patch starting with: diff --git
+        - No explanation, no markdown fences, no commentary
+        - Make minimal targeted changes
+        - Patch must be valid and applicable with `git apply`
+        """
+        user = f"Fix this issue:\n\n{task.problem_statement[:3500]}"
+        if task.hints_text:
+           user += f"\n\nHints:\n{task.hints_text}"
+        if task.fail_to_pass:
+           user += "\n\nTests that must pass:\n" + "\n".join(f"- {t}" for t in task.fail_to_pass)
+        return [
+           {"role": "system", "content": system},
+           {"role": "user",   "content": user},
+        ]
 
-def _force_to_patch(self, raw: str, session: dict) -> dict:
-    """Parse LLM output and force it into patch format."""
-    raw = raw.strip()
-    # Strip markdown fences
-    if "```" in raw:
-        m = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
+    def _force_to_patch(self, raw: str, session: dict) -> dict:
+        """Parse LLM output and force it into patch format."""
+        raw = raw.strip()
+        # Strip markdown fences
+        if "```" in raw:
+           m = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
         if m:
-            raw = m.group(1).strip()
-    # Find diff block
-    if not (raw.startswith("diff --git") or raw.startswith("--- ")):
-        m = re.search(r"(diff --git.*)", raw, re.DOTALL)
-        raw = m.group(1).strip() if m else ""
-    if raw:
-        logger.info("[%s] Valid patch extracted (%d chars)", session["id"], len(raw))
-    else:
-        logger.warning("[%s] No valid diff found in LLM output", session["id"])
-    return {"action": "patch", "content": raw}
+           raw = m.group(1).strip()
+        # Find diff block
+        if not (raw.startswith("diff --git") or raw.startswith("--- ")):
+           m = re.search(r"(diff --git.*)", raw, re.DOTALL)
+           raw = m.group(1).strip() if m else ""
+        if raw:
+           logger.info("[%s] Valid patch extracted (%d chars)", session["id"], len(raw))
+        else:
+           logger.warning("[%s] No valid diff found in LLM output", session["id"])
+        return {"action": "patch", "content": raw}
 
     # ── Prompt Construction ───────────────────────────────────────────────────
 
