@@ -41,8 +41,8 @@ logger = logging.getLogger("purple_agent")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1").rstrip("/")
-MODEL_NAME    = os.getenv("MODEL_NAME", "google/gemma-4-26B-A4B-it:novita")
+LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+MODEL_NAME    = os.getenv("MODEL_NAME", "deepseek/deepseek-v3.2")
 API_KEY       = (
     os.getenv("HF_TOKEN", "")
     or os.getenv("LLM_API_KEY", "")

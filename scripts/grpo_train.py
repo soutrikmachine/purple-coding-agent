@@ -288,7 +288,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="GRPO fine-tuning for Purple Agent")
     p.add_argument("--data", required=True, help="Path to gold_trajectories.jsonl")
     p.add_argument("--output", default="/kaggle/working/grpo_model")
-    p.add_argument("--model", default="google/gemma-4-26B-A4B-it:novita")
+    p.add_argument("--model", default="deepseek/deepseek-v3.2")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--max-seq-len", type=int, default=8192)

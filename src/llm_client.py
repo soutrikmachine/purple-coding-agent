@@ -30,8 +30,8 @@ class LLMClient:
 
     def __init__(
         self,
-        base_url: str = "https://router.huggingface.co/v1",
-        model: str = "google/gemma-4-26B-A4B-it:novita",
+        base_url: str = "https://openrouter.ai/api/v1",
+        model: str = "deepseek/deepseek-v3.2",
         api_key: str = "",
         timeout: int = 120,
         max_retries: int = 3,

@@ -41,8 +41,8 @@ class SWETask:
 class PurpleAgent:
     def __init__(
         self,
-        model_base_url: str = "https://router.huggingface.co/v1",
-        model_name: str = "google/gemma-4-26B-A4B-it:novita",
+        model_base_url: str = "https://openrouter.ai/api/v1",
+        model_name: str = "deepseek/deepseek-v3.2",
         hf_token: str = "",
         max_turns: int = 15,
         mcts_branches: int = 3,

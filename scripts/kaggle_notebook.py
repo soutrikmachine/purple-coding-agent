@@ -71,7 +71,7 @@ for i in range(torch.cuda.device_count()):
 
 import subprocess, time, requests
 
-MODEL_ID = "google/gemma-4-26B-A4B-it:novita"
+MODEL_ID = "deepseek/deepseek-v3.2"
 VLLM_PORT = 8000
 
 proc = subprocess.Popen([

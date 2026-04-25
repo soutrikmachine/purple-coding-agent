@@ -12,10 +12,10 @@
       ]
     },
     "env": {
-      "LLM_BASE_URL": "https://router.huggingface.co/v1",
-      "MODEL_NAME": "google/gemma-4-26B-A4B-it:novita",
+      "LLM_BASE_URL": "https://openrouter.ai/api/v1",
+      "MODEL_NAME": "deepseek/deepseek-v3.2",
       "USE_MCTS": "true",
-      "HF_TOKEN": "${config.hf_token}"
+      "OPENROUTER_API_KEY": "${config.hf_token}"
     }
   },
   "config_schema": {
@@ -23,7 +23,7 @@
     "properties": {
       "hf_token": {
         "type": "string",
-        "title": "Hugging Face Token",
+        "title": "Open Router Token",
         "secret": true
       }
     },
