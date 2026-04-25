@@ -45,9 +45,9 @@ class LLMClient:
         # FIX 2: read token from argument first, then fall back to env vars
         self.api_key = (
             api_key
-            or os.getenv("HF_TOKEN", "")
-            or os.getenv("LLM_API_KEY", "")
             or os.getenv("OPENROUTER_API_KEY", "")
+            or os.getenv("LLM_API_KEY", "")
+            or os.getenv("HF_TOKEN", "")
         )
 
         if self.api_key:
@@ -109,7 +109,7 @@ class LLMClient:
                 if resp.status_code == 401:
                     logger.error(
                         "LLM returned 401 Unauthorized. "
-                        "Check that HF_TOKEN is set correctly in amber-manifest.json5 secrets."
+                        "Check that OPENROUTER_API_KEY is set correctly in amber-manifest.json5 secrets."
                     )
                     return ""
 

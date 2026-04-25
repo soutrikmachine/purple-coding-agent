@@ -44,9 +44,9 @@ logger = logging.getLogger("purple_agent")
 LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 MODEL_NAME    = os.getenv("MODEL_NAME", "deepseek/deepseek-v3.2")
 API_KEY       = (
-    os.getenv("HF_TOKEN", "")
+    os.getenv("OPENROUTER_API_KEY", "")
     or os.getenv("LLM_API_KEY", "")
-    or os.getenv("OPENROUTER_API_KEY", "")
+    or os.getenv("HF_TOKEN", "")
 )
 PORT          = int(os.getenv("PORT", "9010"))
 MAX_TURNS     = int(os.getenv("MAX_TURNS", "10"))
@@ -394,7 +394,7 @@ class LLMClient:
                     timeout=120,
                 )
                 if resp.status_code == 401:
-                    logger.error("LLM 401 Unauthorized — check HF_TOKEN secret")
+                    logger.error("LLM 401 Unauthorized — check OPENROUTER_API_KEY secret")
                     return ""
                 if resp.status_code == 429:
                     wait = 5 * attempt
