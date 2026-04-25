@@ -406,7 +406,7 @@ class LLMClient:
                     return ""
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"]
-                logger.debug("LLM returned %d chars", len(content))
+                logger.info("LLM status=200 returned %d chars", len(content))
                 return content
             except requests.RequestException as e:
                 logger.warning("LLM attempt %d/3: %s", attempt, e)
@@ -506,7 +506,7 @@ class PurpleAgent:
             return self._force_patch(session)
  
         # Select action
-        if USE_MCTS and turn > 1:
+        if USE_MCTS:
             action = self._mcts_action(session)
         else:
             action = self._greedy_action(session)
@@ -530,7 +530,7 @@ class PurpleAgent:
             action = self._parse_action(raw, session)
             score  = self.prm.score_static(action, session["task"])
             candidates.append((action, score))
-            logger.debug("MCTS candidate action=%s score=%.3f", action.get("action"), score)
+            logger.info("[%s] MCTS branch %d/%d action=%s score=%.3f", session["id"][:20], _ + 1, MCTS_BRANCHES, action.get("action"), score)
 
         best, _ = session["mcts"].select_action(candidates)
         logger.info("MCTS stats: %s", session["mcts"].stats())

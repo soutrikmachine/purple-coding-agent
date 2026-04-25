@@ -15,19 +15,21 @@
       "LLM_BASE_URL": "https://openrouter.ai/api/v1",
       "MODEL_NAME": "deepseek/deepseek-v3.2",
       "USE_MCTS": "true",
-      "OPENROUTER_API_KEY": "${config.hf_token}"
+      "MCTS_BRANCHES": "3",
+      "MAX_TURNS": "10",
+      "OPENROUTER_API_KEY": "${config.openrouter_key}"
     }
   },
   "config_schema": {
     "type": "object",
     "properties": {
-      "hf_token": {
+      "openrouter_key": {
         "type": "string",
-        "title": "Open Router Token",
+        "title": "OpenRouter API Key",
         "secret": true
       }
     },
-    "required": ["hf_token"]
+    "required": ["openrouter_key"]
   },
   "provides": {
     "a2a": {
