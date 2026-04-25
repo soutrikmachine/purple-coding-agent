@@ -544,17 +544,17 @@ class PurpleAgent:
         return action
 
     def _greedy_patch(self, session: dict) -> dict:
-       """Single-shot patch generation."""
-       msgs = self._build_patch_messages(session)
-       raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
-       return self._force_to_patch(raw, session)
+        """Single-shot patch generation."""
+        msgs = self._build_patch_messages(session)
+        raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
+        return self._force_to_patch(raw, session)
 
     def _mcts_patch(self, session: dict) -> dict:
-       """
-       MCTS over patch candidates — sample MCTS_BRANCHES patches,
-       score each with static PRM, return highest scoring one.
-       This is inference-time scaling: more branches = better patch selection.
-       """
+        """
+        MCTS over patch candidates — sample MCTS_BRANCHES patches,
+        score each with static PRM, return highest scoring one.
+        This is inference-time scaling: more branches = better patch selection.
+        """
         msgs = self._build_patch_messages(session)
         candidates = []
         for i in range(MCTS_BRANCHES):
