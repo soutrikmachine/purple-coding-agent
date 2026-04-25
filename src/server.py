@@ -507,9 +507,9 @@ class PurpleAgent:
  
         # Select action
         if USE_MCTS:
-            action = self._mcts_action(session)
+            action = self._mcts_patch(session)
         else:
-            action = self._greedy_action(session)
+            action = self._greedy_patch(session)
  
         session["history"].append({"action": action})
         logger.info("[%s] turn=%d action=%s", session["id"], turn, action.get("action"))
