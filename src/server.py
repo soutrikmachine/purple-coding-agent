@@ -589,30 +589,73 @@ class PurpleAgent:
         return best_action
 
     def _build_patch_messages(self, session: dict) -> list[dict]:
-        """Prompt specifically for patch generation (not exploration)."""
         task = session["task"]
-        system = """\
-        You are an expert software engineer. Given a GitHub issue, produce a git unified diff patch.
+        ps   = task.problem_statement
+    
+        # Extract file paths mentioned in the problem statement
+        file_mentions = re.findall(
+            r'[\w/.-]+\.(?:py|go|js|ts|java|rb|rs|c|cpp|h|php|cs|swift)',
+            ps
+        )
+        file_mentions = list(dict.fromkeys(file_mentions))[:10]  # deduplicated
 
-        RULES:
-        - Output ONLY the patch starting with: diff --git
-        - No explanation, no markdown fences, no commentary
-        - Make minimal targeted changes
-        - Patch must be valid and applicable with `git apply`
-        """
-        user = f"Fix this issue:\n\n{task.problem_statement[:3500]}"
-        if task.hints_text:
-           user += f"\n\nHints:\n{task.hints_text}"
+        # Extract function/class names (CamelCase or snake_case identifiers in backticks)
+        code_mentions = re.findall(r'`([^`]+)`', ps)[:15]
+
+        # Build grounding context
+        context_lines = [f"Repository: {task.repo}"]
+        if file_mentions:
+            context_lines.append("Files mentioned in the issue: " + ", ".join(file_mentions))
+        if code_mentions:
+            context_lines.append("Identifiers mentioned: " + ", ".join(code_mentions))
         if task.fail_to_pass:
-           user += "\n\nTests that must pass:\n" + "\n".join(f"- {t}" for t in task.fail_to_pass)
+            context_lines.append("Failing tests: " + ", ".join(task.fail_to_pass[:5]))
+            # Test paths hint at package structure
+            test_files = [t.split("::")[0] for t in task.fail_to_pass[:5]]
+            context_lines.append("Test files: " + ", ".join(test_files))
+        if task.hints_text:
+            context_lines.append(f"Hints: {task.hints_text[:300]}")
+
+        context = "\n".join(context_lines)
+
+        system = f"""\
+        You are an expert software engineer fixing a real GitHub issue.
+
+        CONTEXT:
+        {context}
+
+        CRITICAL RULES:
+        1. Output ONLY a valid unified diff starting with "diff --git"
+        2. NEVER invent file paths — only use files explicitly mentioned in the issue or test paths
+        3. If you cannot determine the exact file path, use the test file path as a guide to find the source file
+        4. The diff MUST apply cleanly with `git apply` on the real repo
+        5. Use realistic line numbers and context lines — if unsure, use 3 lines of context
+        6. Do NOT include <think> tags or any explanation — raw diff only
+        7. Make the MINIMAL change that fixes the described bug
+
+        DIFF FORMAT (must match exactly):
+        diff --git a/path/to/file.ext b/path/to/file.ext
+        --- a/path/to/file.ext
+        +++ b/path/to/file.ext
+        @@ -LINE,COUNT +LINE,COUNT @@
+        context line
+        -removed line
+        +added line
+        context line
+        """
+
+        user = f"Fix this GitHub issue:\n\n{ps[:3000]}"
+    
         return [
-           {"role": "system", "content": system},
-           {"role": "user",   "content": user},
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
         ]
+
 
     def _force_to_patch(self, raw: str, session: dict) -> dict:
         """Parse LLM output and force it into patch format."""
         raw = raw.strip()
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         # Strip markdown fences
         m = None
         if "```" in raw:
@@ -624,9 +667,9 @@ class PurpleAgent:
            m = re.search(r"(diff --git.*)", raw, re.DOTALL)
            raw = m.group(1).strip() if m else ""
         if raw:
-           logger.info("[%s] Valid patch extracted (%d chars)", session["id"], len(raw))
+           logger.info("[%s] Valid patch extracted (%d chars)", session["id"][:20], len(raw))
         else:
-           logger.warning("[%s] No valid diff found in LLM output", session["id"])
+           logger.warning("[%s] No valid diff found in LLM output", session["id"][:20])
         return {"action": "patch", "content": raw}
 
     # ── Prompt Construction ───────────────────────────────────────────────────
