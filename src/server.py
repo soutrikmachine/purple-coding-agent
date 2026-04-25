@@ -597,6 +597,7 @@ class PurpleAgent:
         """Parse LLM output and force it into patch format."""
         raw = raw.strip()
         # Strip markdown fences
+        m = None
         if "```" in raw:
            m = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
         if m:
