@@ -532,7 +532,7 @@ class PurpleAgent:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": prompt},
         ]
-        raw    = self.llm.complete(msgs, temperature=0.15, max_tokens=2048)
+        raw = self.llm.complete(msgs, temperature=0.15, max_tokens=2048)
         action = self._parse_action(raw, session)
         if action.get("action") != "patch":
             content = action.get("content", "")
@@ -555,7 +555,7 @@ class PurpleAgent:
        score each with static PRM, return highest scoring one.
        This is inference-time scaling: more branches = better patch selection.
        """
-        msgs       = self._build_patch_messages(session)
+        msgs = self._build_patch_messages(session)
         candidates = []
         for i in range(MCTS_BRANCHES):
             raw    = self.llm.complete(msgs, temperature=0.3 + i * 0.15, max_tokens=2048)
