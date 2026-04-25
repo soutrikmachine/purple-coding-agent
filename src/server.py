@@ -483,19 +483,36 @@ class PurpleAgent:
         task: SWETask = session["task"]
         session["turn"] += 1
         turn = session["turn"]
-
-        # SWE-bench green agent is SINGLE-TURN — go straight to patch
-        # MCTS is used to sample N candidate patches and pick the best one
-        logger.info("[%s] turn=%d — generating patch directly", session["id"], turn)
-
-        if USE_MCTS:
-           action = self._mcts_patch(session)
+ 
+        # Record observation from green agent
+        if "stdout" in message or "stderr" in message:
+            obs = {
+                "cwd":    message.get("cwd", task.cwd),
+                "stdout": message.get("stdout", ""),
+                "stderr": message.get("stderr", ""),
+            }
+            if session["history"]:
+                session["history"][-1]["observation"] = obs
+                score = self.prm.score_observation(obs, task)
+                session["mcts"].backpropagate(score)
+                logger.info("[%s] turn=%d PRM=%.3f", session["id"], turn, score)
+ 
+                # Update node state from observation
+                self._update_state(session["node_state"], obs)
+ 
+        # Force patch when nearing turn limit
+        if turn >= MAX_TURNS - 1 and not session["submitted_patch"]:
+            logger.info("[%s] Forcing patch (turn limit)", session["id"])
+            return self._force_patch(session)
+ 
+        # Select action
+        if USE_MCTS and turn > 1:
+            action = self._mcts_action(session)
         else:
-           action = self._greedy_patch(session)
-
+            action = self._greedy_action(session)
+ 
         session["history"].append({"action": action})
-        logger.info("[%s] action=%s patch_len=%d",
-                   session["id"], action.get("action"), len(action.get("content", "")))
+        logger.info("[%s] turn=%d action=%s", session["id"], turn, action.get("action"))
         return action
     
     # ── Action Selection ──────────────────────────────────────────────────────
