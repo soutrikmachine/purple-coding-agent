@@ -534,7 +534,7 @@ class LLMClient:
                     CHAT_URL,
                     json=payload,
                     headers=self._headers,
-                    timeout=120,
+                    timeout=180,
                 )
                 if resp.status_code == 401:
                     logger.error("LLM 401 Unauthorized — check OPENROUTER_API_KEY secret")
