@@ -25,6 +25,7 @@ import time
 import uuid
 import urllib.request
 import urllib.error
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,7 +53,7 @@ API_KEY       = (
 )
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
-MAX_TURNS     = int(os.getenv("MAX_TURNS", "20"))
+MAX_TURNS     = int(os.getenv("MAX_TURNS", "10"))
 MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "6"))
 TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.6"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
@@ -101,7 +102,7 @@ def fetch_file_raw(repo: str, ref: str, filepath: str) -> str:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=15) as r:
             if r.status == 200:
                 content = r.read().decode("utf-8", errors="replace")
                 logger.info("GitHub raw fetch OK: %s (%d chars)", filepath, len(content))
@@ -128,7 +129,7 @@ def search_github_for_file(repo: str, filename: str) -> list[str]:
     try:
         import urllib.parse
         req = urllib.request.Request(url, headers=_github_headers())
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=15) as r:
             data  = json.loads(r.read().decode())
             items = data.get("items", [])
             paths = [item["path"] for item in items]
@@ -145,7 +146,7 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
     1. Extract candidate filenames from problem statement and test paths
     2. Try direct fetch first (if full path known)
     3. Fall back to GitHub Search API to find actual path in repo
-    Returns {filepath: content} for up to 4 files.
+    Returns {filepath: content} for up to 6 files.
     """
     if not task.repo:
         return {}
@@ -156,7 +157,7 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
  
     # From test paths (most reliable — these ARE real paths)
     test_paths: list[str] = []
-    for test in task.fail_to_pass[:4]:
+    for test in task.fail_to_pass[:6]:
         test_file = test.split("::")[0]
         test_paths.append(test_file)
  
@@ -182,14 +183,14 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
  
     # Try test paths first — they are real paths
     for fp in test_paths:
-        if fp and len(files) < 4:
+        if fp and len(files) < 6:
             content = fetch_file_raw(task.repo, ref, fp)
             if content:
                 files[fp] = content
  
     # Try full paths from problem statement
     for fp in ps_full_paths:
-        if fp and len(files) < 4:
+        if fp and len(files) < 6:
             content = fetch_file_raw(task.repo, ref, fp)
             if content:
                 files[fp] = content
@@ -197,13 +198,13 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
     # For bare filenames: search the repo to find actual path
     import urllib.parse
     for filename in ps_filenames:
-        if len(files) >= 4:
+        if len(files) >= 6:
             break
         if any(filename in fp for fp in files):
             continue  # already fetched
         found_paths = search_github_for_file(task.repo, filename)
         for fp in found_paths[:2]:
-            if len(files) >= 4:
+            if len(files) >= 6:
                 break
             content = fetch_file_raw(task.repo, ref, fp)
             if content:
@@ -534,7 +535,7 @@ class LLMClient:
                     CHAT_URL,
                     json=payload,
                     headers=self._headers,
-                    timeout=180,
+                    timeout=90,
                 )
                 if resp.status_code == 401:
                     logger.error("LLM 401 Unauthorized — check OPENROUTER_API_KEY secret")
@@ -576,7 +577,7 @@ class PurpleAgent:
         self.prm  = ProgrammablePRM()
         self._sessions: dict[str, dict[str, Any]] = {}
 
-    def respond(self, message: dict) -> dict:
+    async def respond(self, message: dict) -> dict:
         session_id = (
             message.get("session_id")
             or message.get("instance_id")
@@ -589,7 +590,7 @@ class PurpleAgent:
             session = self._sessions[session_id]
 
         try:
-            return self._step(session, message)
+            return await self._step(session, message)
         except Exception as e:
             logger.exception("[%s] Agent step crashed: %s", session_id, e)
             return {"action": "patch", "content": ""}
@@ -624,7 +625,7 @@ class PurpleAgent:
         return session
 
     # ── Step ──────────────────────────────────────────────────────────────────
-    def _step(self, session: dict, message: dict) -> dict:
+    async def _step(self, session: dict, message: dict) -> dict:
         task: SWETask = session["task"]
         session["turn"] += 1
         turn = session["turn"]
@@ -652,7 +653,7 @@ class PurpleAgent:
  
         # Select action
         if USE_MCTS:
-            action = self._mcts_patch(session)
+            action = await self._mcts_patch(session)
         else:
             action = self._greedy_patch(session)
  
@@ -705,25 +706,30 @@ class PurpleAgent:
         raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
         return self._force_to_patch(raw, session)
 
-    def _mcts_patch(self, session: dict) -> dict:
-        """
-        MCTS over patch candidates — sample MCTS_BRANCHES patches,
-        score each with static PRM, return highest scoring one.
-        This is inference-time scaling: more branches = better patch selection.
-        """
+    async def _mcts_patch(self, session: dict) -> dict:
         msgs = self._build_patch_messages(session)
+
+        tasks = [
+            asyncio.to_thread(
+                self.llm.complete, msgs,
+                temperature=0.2 + i * 0.15,
+                max_tokens=2048
+            )
+            for i in range(MCTS_BRANCHES)
+        ]
+        raws = await asyncio.gather(*tasks)
+
         candidates = []
-        for i in range(MCTS_BRANCHES):
-            raw    = self.llm.complete(msgs, temperature=0.3 + i * 0.15, max_tokens=4096)
+        for i, raw in enumerate(raws):
             action = self._force_to_patch(raw, session)
             score  = self.prm.score_static(action, session["task"])
             candidates.append((action, score))
             logger.info("[%s] MCTS branch %d/%d score=%.3f patch_len=%d",
-                       session["id"], i+1, MCTS_BRANCHES, score, len(action.get("content","")))
+                        session["id"][:20], i+1, MCTS_BRANCHES,
+                        score, len(action.get("content", "")))
 
-        # UCT select best
         best_action, best_score = max(candidates, key=lambda x: x[1])
-        logger.info("[%s] MCTS selected branch score=%.3f", session["id"], best_score)
+        logger.info("[%s] MCTS selected score=%.3f", session["id"][:20], best_score)
         session["mcts"].backpropagate(best_score)
         return best_action
 
@@ -955,7 +961,7 @@ async def handle_task(request: Request):
                 task_data.get("repo", "?"),
                 task_data.get("base_commit", "")[:12] or "HEAD")
  
-    action        = agent.respond(task_data)
+    action        = await agent.respond(task_data)
     artifact_text = action.get("content", "") if action.get("action") == "patch" else json.dumps(action)
  
     logger.info("Response: action=%s artifact_len=%d", action.get("action"), len(artifact_text))
