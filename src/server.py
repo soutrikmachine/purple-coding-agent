@@ -44,7 +44,7 @@ logger = logging.getLogger("purple_agent")
 # ── Config ────────────────────────────────────────────────────────────────────
 
 LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-MODEL_NAME    = os.getenv("MODEL_NAME", "deepseek/deepseek-chat-v3-0324")
+MODEL_NAME    = os.getenv("MODEL_NAME", "deepseek/deepseek-v3.2")
 API_KEY       = (
     os.getenv("OPENROUTER_API_KEY", "")
     or os.getenv("LLM_API_KEY", "")
@@ -52,8 +52,8 @@ API_KEY       = (
 )
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
-MAX_TURNS     = int(os.getenv("MAX_TURNS", "15"))
-MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "3"))
+MAX_TURNS     = int(os.getenv("MAX_TURNS", "20"))
+MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "6"))
 TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.6"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
 
@@ -101,7 +101,7 @@ def fetch_file_raw(repo: str, ref: str, filepath: str) -> str:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             if r.status == 200:
                 content = r.read().decode("utf-8", errors="replace")
                 logger.info("GitHub raw fetch OK: %s (%d chars)", filepath, len(content))
@@ -128,7 +128,7 @@ def search_github_for_file(repo: str, filename: str) -> list[str]:
     try:
         import urllib.parse
         req = urllib.request.Request(url, headers=_github_headers())
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             data  = json.loads(r.read().decode())
             items = data.get("items", [])
             paths = [item["path"] for item in items]
@@ -253,7 +253,7 @@ class MCTSNode:
 
 
 class MCTSEngine:
-    def __init__(self, root: MCTSNode, branches: int = 3):
+    def __init__(self, root: MCTSNode, branches: int = 6):
         self.root = root
         self.branches = branches
         self._current = root
@@ -688,7 +688,7 @@ class PurpleAgent:
             {"role": "system", "content": "You are an expert software engineer. Output ONLY a unified diff patch starting with diff --git. No explanation."},
             {"role": "user",   "content": f"Based on exploration:\n{history}\n\nFix:\n{task.problem_statement[:600]}"},
         ]
-        raw = self.llm.complete(msgs, temperature=0.15, max_tokens=4096)
+        raw = self.llm.complete(msgs, temperature=0.15, max_tokens=2048)
         action = self._parse_action(raw, session)
         if action.get("action") != "patch":
             content = action.get("content", "")
@@ -702,7 +702,7 @@ class PurpleAgent:
     def _greedy_patch(self, session: dict) -> dict:
         """Single-shot patch generation."""
         msgs = self._build_patch_messages(session)
-        raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=4096)
+        raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
         return self._force_to_patch(raw, session)
 
     def _mcts_patch(self, session: dict) -> dict:

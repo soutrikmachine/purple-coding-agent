@@ -192,7 +192,7 @@ docker push ghcr.io/YOUR_USERNAME/purple-agent:latest
 | Variable | Default | Description |
 |---|---|---|
 | `LLM_BASE_URL` | `http://vllm:8000` | vLLM/OpenAI-compatible endpoint |
-| `MODEL_NAME` | `deepseek/deepseek-chat-v3-0324` | Model ID |
+| `MODEL_NAME` | `deepseek/deepseek-v3.2` | Model ID |
 | `MAX_TURNS` | `15` | Max turns per task |
 | `MCTS_BRANCHES` | `3` | Candidate actions per MCTS step |
 | `TEMPERATURE` | `0.6` | LLM sampling temperature |
@@ -239,7 +239,7 @@ Fine-tuning uses **Unsloth's MoE Triton Kernels** for 7× speed and 35% less VRA
 
 ```python
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="deepseek/deepseek-chat-v3-0324",
+    model_name="deepseek/deepseek-v3.2",
     max_seq_length=8192,
     load_in_4bit=True,
 )
