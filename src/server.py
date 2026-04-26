@@ -138,6 +138,22 @@ def search_github_for_file(repo: str, filename: str) -> list[str]:
     except Exception as e:
         logger.warning("GitHub search failed for '%s': %s", filename, e)
         return []
+
+def get_repo_tree(repo: str, ref: str) -> list[str]:
+    """Get all file paths in repo using Git Tree API."""
+    ref = ref or "HEAD"
+    url = f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1"
+    try:
+        req = urllib.request.Request(url, headers=_github_headers())
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data  = json.loads(r.read().decode())
+            paths = [item["path"] for item in data.get("tree", [])
+                     if item["type"] == "blob"]
+            logger.info("Repo tree: %d files in %s", len(paths), repo)
+            return paths
+    except Exception as e:
+        logger.warning("Tree API failed for %s: %s", repo, e)
+        return []
  
  
 def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
@@ -209,6 +225,32 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
             content = fetch_file_raw(task.repo, ref, fp)
             if content:
                 files[fp] = content
+
+    # If < 2 files, use tree API + keyword matching
+    if len(files) < 2:
+        tree = get_repo_tree(task.repo, ref)
+        if tree:
+            # Score paths by keyword overlap with problem statement
+            ps_words = set(re.findall(r'\b\w{3,}\b', 
+                                       task.problem_statement.lower()))
+            def path_score(p: str) -> int:
+                p_words = set(re.findall(r'\b\w{3,}\b', p.lower()))
+                return len(ps_words & p_words)
+
+            # Filter to source files only, rank by relevance
+            src_files = [p for p in tree 
+                         if re.search(r'\.(py|go|js|ts|tsx|jsx|rb|java|rs)$', p)
+                         and not any(x in p for x in 
+                                     ['test', 'spec', 'mock', 'vendor', 'node_modules'])]
+            ranked = sorted(src_files, key=path_score, reverse=True)
+
+            for fp in ranked[:4]:
+                if len(files) >= 6:
+                    break
+                if fp not in files:
+                    content = fetch_file_raw(task.repo, ref, fp)
+                    if content:
+                        files[fp] = content
  
     logger.info("Fetched %d files from GitHub for %s", len(files), task.repo)
     return files
@@ -748,13 +790,9 @@ class PurpleAgent:
             file_sections = []
             for filepath, content in real_files.items():
                 lines = content.splitlines()
-                if len(lines) > 200:
-                    # Keep first 100 + last 50 lines for large files
-                    content = (
-                        "\n".join(lines[:100])
-                        + f"\n\n... [{len(lines) - 150} lines omitted] ...\n\n"
-                        + "\n".join(lines[-50:])
-                    )
+                if len(lines) > 150:
+                    content = self._extract_relevant_window(content, task, window=150)
+                    
                 file_sections.append(f"### {filepath}\n```\n{content}\n```")
             file_context = "\n\n## ACTUAL FILE CONTENTS\nUse EXACTLY these lines for your diff:\n\n" + "\n\n".join(file_sections)
             logger.info("[%s] Providing %d real files to model", session["id"][:20], len(real_files))
@@ -804,6 +842,39 @@ class PurpleAgent:
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ]
+    
+    def _extract_relevant_window(self, content: str, task: SWETask, 
+                                  window: int = 150) -> str:
+        """Find the most relevant window of lines using keyword matching."""
+        lines = content.splitlines()
+        if len(lines) <= window:
+            return content
+
+        # Keywords from problem statement + test names
+        keywords = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
+        for test in task.fail_to_pass:
+            func = test.split("::")[-1] if "::" in test else ""
+            if func:
+                keywords.add(func.lower())
+
+        # Score each line by keyword density
+        scores = []
+        for i, line in enumerate(lines):
+            line_words = set(re.findall(r'\b\w{4,}\b', line.lower()))
+            scores.append(len(keywords & line_words))
+
+        # Find the window with highest total score
+        best_start = 0
+        best_score = -1
+        for start in range(0, len(lines) - window, 10):
+            window_score = sum(scores[start:start + window])
+            if window_score > best_score:
+                best_score = window_score
+                best_start = start
+
+        selected = lines[best_start:best_start + window]
+        header = f"[Lines {best_start+1}-{best_start+window} of {len(lines)} total]\n"
+        return header + "\n".join(selected)
 
 
     def _force_to_patch(self, raw: str, session: dict) -> dict:
@@ -962,9 +1033,29 @@ async def handle_task(request: Request):
                 task_data.get("base_commit", "")[:12] or "HEAD")
  
     action        = await agent.respond(task_data)
-    artifact_text = action.get("content", "") if action.get("action") == "patch" else json.dumps(action)
+    artifact_text = action.get("content", "") 
+
+    # If action is bash/debug or content is empty, 
+    # make one final direct LLM call for a patch
+    if action.get("action") != "patch" or not artifact_text.strip():
+        logger.warning("Non-patch action returned — making emergency patch call")
+        ps = task_data.get("problem_statement", "")[:2000]
+        repo = task_data.get("repo", "")
+        emergency_msgs = [
+            {"role": "system", "content": 
+             "Output ONLY a unified diff starting with diff --git. No explanation."},
+            {"role": "user", "content": 
+             f"Repository: {repo}\n\nFix this issue:\n{ps}"},
+        ]
+        raw = await asyncio.to_thread(
+            agent.llm.complete, emergency_msgs, 0.3, 2048
+        )
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        m   = re.search(r'(diff --git.*)', raw, re.DOTALL)
+        artifact_text = m.group(1).strip() if m else ""
+        logger.info("Emergency patch: %d chars", len(artifact_text))
  
-    logger.info("Response: action=%s artifact_len=%d", action.get("action"), len(artifact_text))
+    
  
     return JSONResponse(content={
         "jsonrpc": "2.0",
