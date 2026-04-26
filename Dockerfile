@@ -18,13 +18,13 @@
 # Run (with external vLLM):
 #   docker run -p 9010:9010 \
 #     -e LLM_BASE_URL=http://your-vllm-host:8000 \
-#     -e MODEL_NAME=deepseek/deepseek-v3.2 \
+#     -e MODEL_NAME=deepseek/deepseek-chat-v3-0324 \
 #     purple-agent:latest
 #
 # Run (with local HuggingFace, requires GPU):
 #   docker run --gpus all -p 9010:9010 \
 #     -e LLM_BASE_URL=local \
-#     -e MODEL_NAME=deepseek/deepseek-v3.2 \
+#     -e MODEL_NAME=deepseek/deepseek-chat-v3-0324 \
 #     purple-agent:latest
 # =============================================================================
 
@@ -45,7 +45,7 @@ COPY src/ ./src/
 ENV PYTHONPATH=/app/src
 ENV PORT=9010
 ENV LLM_BASE_URL=https://openrouter.ai/api/v1
-ENV MODEL_NAME=deepseek/deepseek-v3.2
+ENV MODEL_NAME=deepseek/deepseek-chat-v3-0324
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 9010

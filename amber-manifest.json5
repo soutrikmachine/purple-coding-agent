@@ -13,7 +13,7 @@
     },
     "env": {
       "LLM_BASE_URL": "https://openrouter.ai/api/v1",
-      "MODEL_NAME": "deepseek/deepseek-v3.2",
+      "MODEL_NAME": "deepseek/deepseek-chat-v3-0324",
       "USE_MCTS": "true",
       "MCTS_BRANCHES": "3",
       "MAX_TURNS": "15",
