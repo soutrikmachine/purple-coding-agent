@@ -52,7 +52,7 @@ API_KEY       = (
 )
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
-MAX_TURNS     = int(os.getenv("MAX_TURNS", "25"))
+MAX_TURNS     = int(os.getenv("MAX_TURNS", "15"))
 MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "3"))
 TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.6"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
