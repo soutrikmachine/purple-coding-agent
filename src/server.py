@@ -23,12 +23,13 @@ import os
 import re
 import time
 import uuid
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
 from typing import Any
 
 import requests
 import uvicorn
-import urllib.request
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -49,6 +50,7 @@ API_KEY       = (
     or os.getenv("LLM_API_KEY", "")
     or os.getenv("HF_TOKEN", "")
 )
+GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
 MAX_TURNS     = int(os.getenv("MAX_TURNS", "10"))
 MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "3"))
@@ -66,60 +68,148 @@ logger.info("=" * 60)
 logger.info("Purple Agent  model=%s", MODEL_NAME)
 logger.info("Chat URL      %s", CHAT_URL)
 logger.info("API Key       %s", "SET ✓" if API_KEY else "MISSING ✗")
+logger.info("GitHub Token  %s", "SET ✓" if GITHUB_TOKEN else "NOT SET (public repos only)")
 logger.info("MCTS          branches=%d  max_turns=%d  enabled=%s",
             MCTS_BRANCHES, MAX_TURNS, USE_MCTS)
 logger.info("=" * 60)
 
 #==============================================================================
-# Studying GitHub Real Content
+# GitHub file fetching 
 #==============================================================================
 
-def fetch_file_from_github(repo: str, commit: str, filepath: str) -> str:
-    """Fetch actual file content at the exact commit from GitHub API."""
-    url = f"https://api.github.com/repos/{repo}/contents/{filepath}?ref={commit}"
-    headers = {"Accept": "application/vnd.github.raw+json"}
-    if GITHUB_TOKEN := os.getenv("GITHUB_TOKEN", ""):
+def _github_headers() -> dict:
+    """Build headers for GitHub API calls."""
+    h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+ 
+ 
+def fetch_file_raw(repo: str, ref: str, filepath: str) -> str:
+    """
+    FIX 1: Fetch raw file content using raw.githubusercontent.com.
+    This is simpler and more reliable than the Contents API.
+    Works for public repos without any auth token.
+ 
+    URL: https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{filepath}
+    """
+    # ref can be a commit SHA or branch name; use HEAD if empty
+    ref = ref or "HEAD"
+    url = f"https://raw.githubusercontent.com/{repo}/{ref}/{filepath}"
+    headers = {}
+    if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as r:
-            return r.read().decode()
+            if r.status == 200:
+                content = r.read().decode("utf-8", errors="replace")
+                logger.info("GitHub raw fetch OK: %s (%d chars)", filepath, len(content))
+                return content
+    except urllib.error.HTTPError as e:
+        logger.warning("GitHub fetch failed for %s: HTTP %d", filepath, e.code)
     except Exception as e:
         logger.warning("GitHub fetch failed for %s: %s", filepath, e)
-        return ""
-
-def fetch_relevant_files(task: SWETask) -> dict[str, str]:
+    return ""
+ 
+ 
+def search_github_for_file(repo: str, filename: str) -> list[str]:
     """
-    Fetch actual file content for files mentioned in the issue.
-    Returns {filepath: content} for up to 3 files.
+    FIX 2: Use GitHub Code Search API to find the actual path of a file
+    within the repository. Essential for monorepos where paths are deep.
+ 
+    Returns a list of file paths found (e.g. ['packages/foo/bar/TotpInput.tsx'])
     """
-    if not task.repo or not task.base_commit:
+    # Strip extension for broader search
+    name_no_ext = re.sub(r'\.\w+$', '', filename)
+    query = f"{name_no_ext} repo:{repo}"
+    url   = f"https://api.github.com/search/code?q={urllib.parse.quote(query)}&per_page=5"
+ 
+    try:
+        import urllib.parse
+        req = urllib.request.Request(url, headers=_github_headers())
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data  = json.loads(r.read().decode())
+            items = data.get("items", [])
+            paths = [item["path"] for item in items]
+            logger.info("GitHub search '%s' → %s", filename, paths[:3])
+            return paths
+    except Exception as e:
+        logger.warning("GitHub search failed for '%s': %s", filename, e)
+        return []
+ 
+ 
+def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
+    """
+    FIX 3: Improved file fetching strategy:
+    1. Extract candidate filenames from problem statement and test paths
+    2. Try direct fetch first (if full path known)
+    3. Fall back to GitHub Search API to find actual path in repo
+    Returns {filepath: content} for up to 4 files.
+    """
+    if not task.repo:
         return {}
-
-    # Extract candidate file paths from problem statement + test paths
-    candidates = set()
-    
-    # From test paths: tests/foo/test_bar.py → src/foo/bar.py
-    for test in task.fail_to_pass[:3]:
+ 
+    ref = task.base_commit or "HEAD"
+ 
+    # ── Collect candidate paths ───────────────────────────────────────────────
+ 
+    # From test paths (most reliable — these ARE real paths)
+    test_paths: list[str] = []
+    for test in task.fail_to_pass[:4]:
         test_file = test.split("::")[0]
-        candidates.add(test_file)
-        # Also try source file equivalent
-        src = test_file.replace("tests/", "src/").replace("test_", "")
-        candidates.add(src)
-
-    # From problem statement: file paths in backticks or mentioned explicitly
-    ps_files = re.findall(
-        r'[\w/.-]+\.(?:py|go|js|ts|java|rb|rs|c|cpp|h|php|cs)',
-        task.problem_statement
+        test_paths.append(test_file)
+ 
+    # From problem statement: full paths (e.g. `lib/foo/bar.py`)
+    ps_full_paths = re.findall(
+        r'(?:^|[\s`"\'])('
+        r'[\w][\w/.-]+\.(?:py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h|php|cs|swift|kt)'
+        r')',
+        task.problem_statement,
+        re.MULTILINE,
     )
-    candidates.update(ps_files[:5])
-
-    files = {}
-    for fp in list(candidates)[:4]:  # cap at 4 files
-        content = fetch_file_from_github(task.repo, task.base_commit, fp)
-        if content:
-            files[fp] = content
-            logger.info("Fetched %s (%d chars)", fp, len(content))
+    ps_full_paths = [p.strip() for p in ps_full_paths][:5]
+ 
+    # From problem statement: bare filenames in backticks
+    ps_filenames = re.findall(
+        r'`([\w.-]+\.(?:py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h|php|cs|swift|kt))`',
+        task.problem_statement,
+    )[:5]
+ 
+    # ── Attempt fetches ───────────────────────────────────────────────────────
+ 
+    files: dict[str, str] = {}
+ 
+    # Try test paths first — they are real paths
+    for fp in test_paths:
+        if fp and len(files) < 4:
+            content = fetch_file_raw(task.repo, ref, fp)
+            if content:
+                files[fp] = content
+ 
+    # Try full paths from problem statement
+    for fp in ps_full_paths:
+        if fp and len(files) < 4:
+            content = fetch_file_raw(task.repo, ref, fp)
+            if content:
+                files[fp] = content
+ 
+    # For bare filenames: search the repo to find actual path
+    import urllib.parse
+    for filename in ps_filenames:
+        if len(files) >= 4:
+            break
+        if any(filename in fp for fp in files):
+            continue  # already fetched
+        found_paths = search_github_for_file(task.repo, filename)
+        for fp in found_paths[:2]:
+            if len(files) >= 4:
+                break
+            content = fetch_file_raw(task.repo, ref, fp)
+            if content:
+                files[fp] = content
+ 
+    logger.info("Fetched %d files from GitHub for %s", len(files), task.repo)
     return files
 
 # ==============================================================================
@@ -527,6 +617,7 @@ class PurpleAgent:
             "turn": 0,
             "history": [],
             "submitted_patch": None,
+            "_fetched_files": None,
         }
         self._sessions[session_id] = session
         logger.info("[%s] New session repo=%s", session_id, task.repo)
@@ -593,15 +684,9 @@ class PurpleAgent:
     def _force_patch(self, session: dict) -> dict:
         task    = session["task"]
         history = self._format_history(session["history"])
-        prompt  = (
-            f"Based on your exploration so far:\n{history}\n\n"
-            f"Problem:\n{task.problem_statement[:600]}\n\n"
-            "Now produce the final unified diff patch. "
-            "Output ONLY the patch starting with diff --git. No explanation."
-        )
-        msgs = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
+        msgs    = [
+            {"role": "system", "content": "You are an expert software engineer. Output ONLY a unified diff patch starting with diff --git. No explanation."},
+            {"role": "user",   "content": f"Based on exploration:\n{history}\n\nFix:\n{task.problem_statement[:600]}"},
         ]
         raw = self.llm.complete(msgs, temperature=0.15, max_tokens=2048)
         action = self._parse_action(raw, session)
@@ -644,42 +729,74 @@ class PurpleAgent:
 
     def _build_patch_messages(self, session: dict) -> list[dict]:
         task = session["task"]
-    
-        # Fetch real file content
-        real_files = fetch_relevant_files(task)
-    
-        file_context = ""
+ 
+        # Fetch files once per session (cached), not once per MCTS branch
+        if session["_fetched_files"] is None:
+            session["_fetched_files"] = fetch_relevant_files(task)
+        real_files = session["_fetched_files"]
+ 
+        # FIX 4: Build system prompt WITHOUT leading indentation
+        # The old version used f"""...""" with indented lines — this added
+        # spaces to every line which confused the model.
         if real_files:
-            file_context = "\n\n## ACTUAL FILE CONTENTS (use these for your diff):\n"
+            file_sections = []
             for filepath, content in real_files.items():
-                # Truncate very long files but keep most relevant parts
                 lines = content.splitlines()
-                if len(lines) > 150:
-                    content = "\n".join(lines[:150]) + f"\n... ({len(lines)} total lines)"
-                file_context += f"\n### {filepath}\n```\n{content}\n```\n"
+                if len(lines) > 200:
+                    # Keep first 100 + last 50 lines for large files
+                    content = (
+                        "\n".join(lines[:100])
+                        + f"\n\n... [{len(lines) - 150} lines omitted] ...\n\n"
+                        + "\n".join(lines[-50:])
+                    )
+                file_sections.append(f"### {filepath}\n```\n{content}\n```")
+            file_context = "\n\n## ACTUAL FILE CONTENTS\nUse EXACTLY these lines for your diff:\n\n" + "\n\n".join(file_sections)
+            logger.info("[%s] Providing %d real files to model", session["id"][:20], len(real_files))
         else:
-            file_context = "\n\n(No file content available — infer from the issue description)"
-
-        system = f"""You are an expert software engineer fixing a real GitHub issue.
-                 Repository: {task.repo}
-                 Commit: {task.base_commit or 'HEAD'}
-                 {file_context}
-
-                 RULES:
-                 1. Output ONLY a valid unified diff starting with "diff --git"
-                 2. Use EXACT line content from the files shown above
-                 3. Include 3 lines of context before and after each change
-                 4. No <think> tags, no explanation, no markdown fences — raw diff only
-                 5. Make the MINIMAL change that fixes the issue
-                 """
-
-        user = f"Fix this issue:\n\n{task.problem_statement[:2000]}"
+            file_context = "\n\n## NOTE\nCould not fetch file content from GitHub. Infer from the issue description and test file paths."
+            logger.warning("[%s] No files fetched — model working blind", session["id"][:20])
+ 
+        # Build test hints
+        test_hint = ""
+        if task.fail_to_pass:
+            test_hint = "\n\nFailing tests (these must pass after your fix):\n" + "\n".join(
+                f"  - {t}" for t in task.fail_to_pass[:5]
+            )
+ 
+        hints_hint = ""
         if task.hints_text:
-            user += f"\n\nHints: {task.hints_text[:300]}"
-
+            hints_hint = f"\n\nHints from issue tracker:\n{task.hints_text[:400]}"
+ 
+        system = (
+            "You are an expert software engineer fixing a real GitHub issue.\n"
+            f"Repository: {task.repo}\n"
+            f"Commit: {task.base_commit or 'HEAD'}\n"
+            f"{file_context}\n"
+            "\n"
+            "RULES:\n"
+            "1. Output ONLY a valid unified diff starting exactly with: diff --git\n"
+            "2. Use EXACT line content from the files shown above — do NOT invent lines\n"
+            "3. Include 3 lines of unchanged context before and after each change\n"
+            "4. Do NOT include <think> tags, explanations, or markdown fences\n"
+            "5. Make the MINIMAL change that fixes the described bug\n"
+            "6. If multiple files need changes, include all diffs in one output\n"
+            "\n"
+            "DIFF FORMAT:\n"
+            "diff --git a/path/to/file.ext b/path/to/file.ext\n"
+            "--- a/path/to/file.ext\n"
+            "+++ b/path/to/file.ext\n"
+            "@@ -LINE,COUNT +LINE,COUNT @@\n"
+            " context line\n"
+            "-removed line\n"
+            "+added line\n"
+            " context line\n"
+        )
+ 
+        user = f"Fix this GitHub issue:\n\n{task.problem_statement[:2500]}{test_hint}{hints_hint}"
+ 
         return [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user",   "content": user},
         ]
 
 
@@ -709,15 +826,13 @@ class PurpleAgent:
         task    = session["task"]
         history = session["history"]
         state   = session["node_state"]
-
-        # Inject state summary into system prompt
-        system = SYSTEM_PROMPT
-        if state.summarize() != "No state yet.":
-            system += f"\n\n## Current Branch State\n{state.summarize()}"
-
+        system  = "You are a software engineer. Fix the bug described."
+        summary = state.summarize()
+        if summary:
+            system += f"\n\nCurrent state:\n{summary}"
         messages = [
             {"role": "system", "content": system},
-            {"role": "user",   "content": build_user_prompt(task)},
+            {"role": "user",   "content": task.problem_statement[:2000]},
         ]
         for entry in history:
             action = entry.get("action", {})
@@ -727,10 +842,7 @@ class PurpleAgent:
             })
             obs = entry.get("observation")
             if obs:
-                messages.append({
-                    "role":    "user",
-                    "content": build_obs_prompt(obs),
-                })
+                messages.append({"role": "user", "content": str(obs)[:1000]})
         return messages
 
     # ── State Update ──────────────────────────────────────────────────────────
@@ -747,23 +859,12 @@ class PurpleAgent:
 
     def _parse_action(self, raw: str, session: dict) -> dict:
         raw     = raw.strip()
-        thought = self._tag(raw, "thought") or ""
         command = (self._tag(raw, "command") or "bash").strip().lower()
         content = (self._tag(raw, "content") or "").strip()
-
-        if thought:
-            logger.info("[%s] Thought: %s", session["id"], thought[:200])
-
         if command not in ("bash", "debug", "patch"):
             command = "patch" if ("diff --git" in content or "--- a/" in content) else "bash"
-
-        if command == "bash":
-            for danger in ["rm -rf", "rm -f", "> /", "dd if=", "mkfs"]:
-                if danger in content:
-                    content = f"echo '[BLOCKED: {danger}]'"
-                    break
-
         return {"action": command, "content": content}
+ 
 
     @staticmethod
     def _tag(text: str, tag: str) -> str | None:
@@ -793,7 +894,7 @@ AGENT_CARD = {
     "name": "Purple Coding Agent",
     "description": (
         "MCTS-guided software engineering agent for SWE-bench Pro. "
-        "Powered by Qwen2.5-Coder-7B via HuggingFace Router."
+        "Powered by DeepSeek V3.2 + GitHub context."
     ),
     "url": f"http://localhost:{PORT}/",
     "version": "1.0.0",
@@ -834,47 +935,47 @@ async def health():
 @app.post("/")
 async def handle_task(request: Request):
     body = await request.json()
-
+ 
     jsonrpc_id  = body.get("id", str(uuid.uuid4()))
     task_id     = str(uuid.uuid4())
     artifact_id = str(uuid.uuid4())
-
+ 
+    logger.info("─" * 50)
+    logger.info("Request id=%s method=%s", jsonrpc_id, body.get("method"))
+ 
     task_data, context_id = _extract_task_and_context(body)
     if not context_id:
         context_id = str(uuid.uuid4())
-
-    # KEY FIX: use contextId as session key — it persists across ALL turns
-    # instance_id is only in turn 1, contextId is in every turn
+ 
     task_data["session_id"] = context_id
-
+ 
     ps = task_data.get("problem_statement", "")
-    logger.info("context_id=%s ps_len=%d", context_id, len(ps))
-
-    action = agent.respond(task_data)
-
-    # Return bash/debug actions as JSON, patch as raw diff
-    if action.get("action") == "patch":
-        artifact_text = action.get("content", "")
-    else:
-        artifact_text = json.dumps(action)
-
-    response = {
+    logger.info("context_id=%s ps_len=%d repo=%s commit=%s",
+                context_id[:20], len(ps),
+                task_data.get("repo", "?"),
+                task_data.get("base_commit", "")[:12] or "HEAD")
+ 
+    action        = agent.respond(task_data)
+    artifact_text = action.get("content", "") if action.get("action") == "patch" else json.dumps(action)
+ 
+    logger.info("Response: action=%s artifact_len=%d", action.get("action"), len(artifact_text))
+ 
+    return JSONResponse(content={
         "jsonrpc": "2.0",
-        "id": jsonrpc_id,
+        "id":      jsonrpc_id,
         "result": {
-            "id": task_id,
+            "id":        task_id,
             "contextId": context_id,
-            "status": {"state": "completed"},
+            "status":    {"state": "completed"},
             "artifacts": [
                 {
                     "artifactId": artifact_id,
-                    "name": "patch",
-                    "parts": [{"kind": "text", "text": artifact_text}],
+                    "name":       "patch",
+                    "parts":      [{"kind": "text", "text": artifact_text}],
                 }
             ],
         },
-    }
-    return JSONResponse(content=response)
+    })
 
 
 # ==============================================================================
@@ -882,67 +983,49 @@ async def handle_task(request: Request):
 # ==============================================================================
 
 def _extract_task_and_context(body: dict) -> tuple[dict, str]:
-    """
-    Parse A2A JSON-RPC envelope from SWE-bench green agent.
-
-    Structure:
-    {
-      "jsonrpc": "2.0",
-      "id": "...",
-      "method": "message/send",
-      "params": {
-        "message": {
-          "role": "user",
-          "contextId": "...",
-          "parts": [
-            {"kind": "text", "text": "{\"problem_statement\": \"...\", ...}"}
-          ]
-        }
-      }
-    }
-    """
     context_id = ""
-
-    # Direct top-level (fallback)
+ 
     if "problem_statement" in body:
         return body, context_id
-
+ 
     try:
-        params  = body.get("params", {})
-        message = params.get("message", {})
+        params     = body.get("params", {})
+        message    = params.get("message", {})
         context_id = message.get("contextId", "") or params.get("contextId", "")
-
+ 
         parts = message.get("parts", [])
-        logger.info("Parts: %d", len(parts))
-
+        logger.info("Parts: %d  contextId=%s", len(parts), context_id[:20] if context_id else "none")
+ 
         for i, part in enumerate(parts):
             kind = part.get("kind") or part.get("type", "")
             text = part.get("text", "")
             logger.info("Part[%d] kind=%s len=%d preview=%s", i, kind, len(text), text[:200])
-
+ 
+            if kind == "data":
+                data = part.get("data", {})
+                if isinstance(data, dict) and "problem_statement" in data:
+                    return data, context_id
+ 
             if kind == "text" and text.strip():
                 try:
                     parsed = json.loads(text)
                     if isinstance(parsed, dict):
                         if "problem_statement" in parsed:
                             return parsed, context_id
-                        # Whole dict is the task
-                        if any(k in parsed for k in ("repo", "instance_id", "hints_text")):
+                        if any(k in parsed for k in ("stdout", "stderr", "cwd", "repo", "instance_id")):
                             return parsed, context_id
                 except (json.JSONDecodeError, ValueError):
                     pass
-                # Raw text — wrap it
                 return {"problem_statement": text.strip()}, context_id
-
+ 
     except Exception as e:
         logger.error("Extraction error: %s", e)
-
-    # Deep search
+ 
     ps = _deep_find(body, "problem_statement")
     if ps:
         return {"problem_statement": ps}, context_id
-
-    logger.warning("No problem_statement found. Keys: %s", list(body.keys()))
+ 
+    logger.warning("Nothing found. Body keys: %s", list(body.keys()))
     return {}, context_id
 
 
