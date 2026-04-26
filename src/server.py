@@ -817,23 +817,28 @@ class PurpleAgent:
             f"Commit: {task.base_commit or 'HEAD'}\n"
             f"{file_context}\n"
             "\n"
-            "RULES:\n"
+            "CRITICAL RULES:\n"
             "1. Output ONLY a valid unified diff starting exactly with: diff --git\n"
-            "2. Use EXACT line content from the files shown above — do NOT invent lines\n"
-            "3. Include 3 lines of unchanged context before and after each change\n"
-            "4. Do NOT include <think> tags, explanations, or markdown fences\n"
-            "5. Make the MINIMAL change that fixes the described bug\n"
-            "6. If multiple files need changes, include all diffs in one output\n"
+            "2. Copy context lines CHARACTER-FOR-CHARACTER from the file shown above\n"
+            "   Even one space difference will break git apply\n"
+            "3. Change MAXIMUM 10 lines — make the smallest possible fix\n"
+            "4. Use the line numbers shown (e.g. '  42: code') for the @@ header\n"
+            "5. Include exactly 3 unchanged context lines before and after each change\n"
+            "6. Do NOT include <think> tags, explanations, or markdown fences\n"
             "\n"
             "DIFF FORMAT:\n"
-            "diff --git a/path/to/file.ext b/path/to/file.ext\n"
-            "--- a/path/to/file.ext\n"
-            "+++ b/path/to/file.ext\n"
-            "@@ -LINE,COUNT +LINE,COUNT @@\n"
-            " context line\n"
-            "-removed line\n"
-            "+added line\n"
-            " context line\n"
+            "diff --git a/path/file.go b/path/file.go\n"
+            "--- a/path/file.go\n"
+            "+++ b/path/file.go\n"
+            "@@ -42,7 +42,7 @@\n"
+            " exact context line from file\n"
+            " exact context line from file\n"
+            " exact context line from file\n"
+            "-old line to remove\n"
+            "+new line to add\n"
+            " exact context line from file\n"
+            " exact context line from file\n"
+            " exact context line from file\n"
         )
  
         user = f"Fix this GitHub issue:\n\n{task.problem_statement[:2500]}{test_hint}{hints_hint}"
@@ -844,11 +849,11 @@ class PurpleAgent:
         ]
     
     def _extract_relevant_window(self, content: str, task: SWETask, 
-                                  window: int = 150) -> str:
+                                  window: int = 80) -> str:
         """Find the most relevant window of lines using keyword matching."""
         lines = content.splitlines()
         if len(lines) <= window:
-            return content
+            return "\n".join(f"{i+1:4d}: {line}" for i, line in enumerate(lines))
 
         # Keywords from problem statement + test names
         keywords = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
@@ -873,8 +878,11 @@ class PurpleAgent:
                 best_start = start
 
         selected = lines[best_start:best_start + window]
-        header = f"[Lines {best_start+1}-{best_start+window} of {len(lines)} total]\n"
-        return header + "\n".join(selected)
+        numbered = "\n".join(
+            f"{best_start + i + 1:4d}: {line}" 
+            for i, line in enumerate(selected)
+        )
+        return f"[Showing lines {best_start+1}-{best_start+window} of {len(lines)}]\n{numbered}"
 
 
     def _force_to_patch(self, raw: str, session: dict) -> dict:
