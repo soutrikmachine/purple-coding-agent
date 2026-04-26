@@ -22,9 +22,18 @@
     }
   },
   "config_schema": {
+    "type": "object",
     "properties": {
-      "github_token": {"type": "string", "title": "GitHub Token", "secret": true},
-      "openrouter_key": {"type": "string", "title": "OpenRouter API Key", "secret": true}
+      "openrouter_key": {
+        "type": "string",
+        "title": "OpenRouter API Key",
+        "secret": true
+      },
+      "github_token": {
+        "type": "string",
+        "title": "GitHub Token",
+        "secret": true
+      }
     }
   },
   "provides": {
