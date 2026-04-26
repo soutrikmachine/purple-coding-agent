@@ -16,7 +16,7 @@
       "MODEL_NAME": "deepseek/deepseek-v3.2",
       "USE_MCTS": "true",
       "MCTS_BRANCHES": "3",
-      "MAX_TURNS": "10",
+      "MAX_TURNS": "25",
       "OPENROUTER_API_KEY": "${config.openrouter_key}",
       "GITHUB_TOKEN": "${config.github_token}"
     }

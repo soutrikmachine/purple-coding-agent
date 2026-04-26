@@ -52,7 +52,7 @@ API_KEY       = (
 )
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
-MAX_TURNS     = int(os.getenv("MAX_TURNS", "10"))
+MAX_TURNS     = int(os.getenv("MAX_TURNS", "25"))
 MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "3"))
 TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.6"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
@@ -520,7 +520,7 @@ class LLMClient:
         self,
         messages: list[dict],
         temperature: float = 0.6,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
     ) -> str:
         payload: dict[str, Any] = {
             "model": MODEL_NAME,
@@ -688,7 +688,7 @@ class PurpleAgent:
             {"role": "system", "content": "You are an expert software engineer. Output ONLY a unified diff patch starting with diff --git. No explanation."},
             {"role": "user",   "content": f"Based on exploration:\n{history}\n\nFix:\n{task.problem_statement[:600]}"},
         ]
-        raw = self.llm.complete(msgs, temperature=0.15, max_tokens=2048)
+        raw = self.llm.complete(msgs, temperature=0.15, max_tokens=4096)
         action = self._parse_action(raw, session)
         if action.get("action") != "patch":
             content = action.get("content", "")
@@ -702,7 +702,7 @@ class PurpleAgent:
     def _greedy_patch(self, session: dict) -> dict:
         """Single-shot patch generation."""
         msgs = self._build_patch_messages(session)
-        raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
+        raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=4096)
         return self._force_to_patch(raw, session)
 
     def _mcts_patch(self, session: dict) -> dict:
@@ -714,7 +714,7 @@ class PurpleAgent:
         msgs = self._build_patch_messages(session)
         candidates = []
         for i in range(MCTS_BRANCHES):
-            raw    = self.llm.complete(msgs, temperature=0.3 + i * 0.15, max_tokens=2048)
+            raw    = self.llm.complete(msgs, temperature=0.3 + i * 0.15, max_tokens=4096)
             action = self._force_to_patch(raw, session)
             score  = self.prm.score_static(action, session["task"])
             candidates.append((action, score))
