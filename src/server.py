@@ -28,6 +28,7 @@ from typing import Any
 
 import requests
 import uvicorn
+import urllib.request
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -69,6 +70,57 @@ logger.info("MCTS          branches=%d  max_turns=%d  enabled=%s",
             MCTS_BRANCHES, MAX_TURNS, USE_MCTS)
 logger.info("=" * 60)
 
+#==============================================================================
+# Studying GitHub Real Content
+#==============================================================================
+
+def fetch_file_from_github(repo: str, commit: str, filepath: str) -> str:
+    """Fetch actual file content at the exact commit from GitHub API."""
+    url = f"https://api.github.com/repos/{repo}/contents/{filepath}?ref={commit}"
+    headers = {"Accept": "application/vnd.github.raw+json"}
+    if GITHUB_TOKEN := os.getenv("GITHUB_TOKEN", ""):
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.read().decode()
+    except Exception as e:
+        logger.warning("GitHub fetch failed for %s: %s", filepath, e)
+        return ""
+
+def fetch_relevant_files(task: SWETask) -> dict[str, str]:
+    """
+    Fetch actual file content for files mentioned in the issue.
+    Returns {filepath: content} for up to 3 files.
+    """
+    if not task.repo or not task.base_commit:
+        return {}
+
+    # Extract candidate file paths from problem statement + test paths
+    candidates = set()
+    
+    # From test paths: tests/foo/test_bar.py → src/foo/bar.py
+    for test in task.fail_to_pass[:3]:
+        test_file = test.split("::")[0]
+        candidates.add(test_file)
+        # Also try source file equivalent
+        src = test_file.replace("tests/", "src/").replace("test_", "")
+        candidates.add(src)
+
+    # From problem statement: file paths in backticks or mentioned explicitly
+    ps_files = re.findall(
+        r'[\w/.-]+\.(?:py|go|js|ts|java|rb|rs|c|cpp|h|php|cs)',
+        task.problem_statement
+    )
+    candidates.update(ps_files[:5])
+
+    files = {}
+    for fp in list(candidates)[:4]:  # cap at 4 files
+        content = fetch_file_from_github(task.repo, task.base_commit, fp)
+        if content:
+            files[fp] = content
+            logger.info("Fetched %s (%d chars)", fp, len(content))
+    return files
 
 # ==============================================================================
 # MCTS ENGINE
@@ -287,6 +339,7 @@ class SWETask:
     pass_to_pass: list[str] = field(default_factory=list)
     repo: str = ""
     instance_id: str = ""
+    base_commit: str = ""
 
 
 # ==============================================================================
@@ -463,6 +516,7 @@ class PurpleAgent:
             pass_to_pass=message.get("pass_to_pass", []) or [],
             repo=message.get("repo", ""),
             instance_id=message.get("instance_id", ""),
+            base_commit=message.get("base_commit", "")
         )
         root = MCTSNode(state=NodeState(cwd=task.cwd).__dict__)
         session = {
@@ -590,65 +644,42 @@ class PurpleAgent:
 
     def _build_patch_messages(self, session: dict) -> list[dict]:
         task = session["task"]
-        ps   = task.problem_statement
     
-        # Extract file paths mentioned in the problem statement
-        file_mentions = re.findall(
-            r'[\w/.-]+\.(?:py|go|js|ts|java|rb|rs|c|cpp|h|php|cs|swift)',
-            ps
-        )
-        file_mentions = list(dict.fromkeys(file_mentions))[:10]  # deduplicated
+        # Fetch real file content
+        real_files = fetch_relevant_files(task)
+    
+        file_context = ""
+        if real_files:
+            file_context = "\n\n## ACTUAL FILE CONTENTS (use these for your diff):\n"
+            for filepath, content in real_files.items():
+                # Truncate very long files but keep most relevant parts
+                lines = content.splitlines()
+                if len(lines) > 150:
+                    content = "\n".join(lines[:150]) + f"\n... ({len(lines)} total lines)"
+                file_context += f"\n### {filepath}\n```\n{content}\n```\n"
+        else:
+            file_context = "\n\n(No file content available — infer from the issue description)"
 
-        # Extract function/class names (CamelCase or snake_case identifiers in backticks)
-        code_mentions = re.findall(r'`([^`]+)`', ps)[:15]
+        system = f"""You are an expert software engineer fixing a real GitHub issue.
+                 Repository: {task.repo}
+                 Commit: {task.base_commit or 'HEAD'}
+                 {file_context}
 
-        # Build grounding context
-        context_lines = [f"Repository: {task.repo}"]
-        if file_mentions:
-            context_lines.append("Files mentioned in the issue: " + ", ".join(file_mentions))
-        if code_mentions:
-            context_lines.append("Identifiers mentioned: " + ", ".join(code_mentions))
-        if task.fail_to_pass:
-            context_lines.append("Failing tests: " + ", ".join(task.fail_to_pass[:5]))
-            # Test paths hint at package structure
-            test_files = [t.split("::")[0] for t in task.fail_to_pass[:5]]
-            context_lines.append("Test files: " + ", ".join(test_files))
+                 RULES:
+                 1. Output ONLY a valid unified diff starting with "diff --git"
+                 2. Use EXACT line content from the files shown above
+                 3. Include 3 lines of context before and after each change
+                 4. No <think> tags, no explanation, no markdown fences — raw diff only
+                 5. Make the MINIMAL change that fixes the issue
+                 """
+
+        user = f"Fix this issue:\n\n{task.problem_statement[:2000]}"
         if task.hints_text:
-            context_lines.append(f"Hints: {task.hints_text[:300]}")
+            user += f"\n\nHints: {task.hints_text[:300]}"
 
-        context = "\n".join(context_lines)
-
-        system = f"""\
-        You are an expert software engineer fixing a real GitHub issue.
-
-        CONTEXT:
-        {context}
-
-        CRITICAL RULES:
-        1. Output ONLY a valid unified diff starting with "diff --git"
-        2. NEVER invent file paths — only use files explicitly mentioned in the issue or test paths
-        3. If you cannot determine the exact file path, use the test file path as a guide to find the source file
-        4. The diff MUST apply cleanly with `git apply` on the real repo
-        5. Use realistic line numbers and context lines — if unsure, use 3 lines of context
-        6. Do NOT include <think> tags or any explanation — raw diff only
-        7. Make the MINIMAL change that fixes the described bug
-
-        DIFF FORMAT (must match exactly):
-        diff --git a/path/to/file.ext b/path/to/file.ext
-        --- a/path/to/file.ext
-        +++ b/path/to/file.ext
-        @@ -LINE,COUNT +LINE,COUNT @@
-        context line
-        -removed line
-        +added line
-        context line
-        """
-
-        user = f"Fix this GitHub issue:\n\n{ps[:3000]}"
-    
         return [
             {"role": "system", "content": system},
-            {"role": "user",   "content": user},
+            {"role": "user", "content": user},
         ]
 
 

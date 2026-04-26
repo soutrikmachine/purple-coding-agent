@@ -17,7 +17,8 @@
       "USE_MCTS": "true",
       "MCTS_BRANCHES": "3",
       "MAX_TURNS": "10",
-      "OPENROUTER_API_KEY": "${config.openrouter_key}"
+      "OPENROUTER_API_KEY": "${config.openrouter_key}",
+      "GITHUB_TOKEN": "${config.github_token}"
     }
   },
   "config_schema": {
@@ -30,6 +31,17 @@
       }
     },
     "required": ["openrouter_key"]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "github_token": {
+        "type": "string",
+        "title": "GitHub Token",
+        "secret": true
+      }
+    },
+    "required": ["github_token"]
   },
   "provides": {
     "a2a": {
