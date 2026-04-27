@@ -435,7 +435,6 @@ class LLMClient:
             "messages":    messages,
             "temperature": temperature,
             "max_tokens":  max_tokens,
-            "reasoning": {"effort": "high"},
         }
         for attempt in range(1, 4):
             try:
