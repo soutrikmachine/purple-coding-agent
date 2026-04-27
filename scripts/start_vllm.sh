@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-MODEL="${MODEL:-deepseek/deepseek-v3.2}"
+MODEL="${MODEL:-google/gemma-4-31b-it}"
 PORT="${PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_UTIL="${GPU_UTIL:-0.88}"

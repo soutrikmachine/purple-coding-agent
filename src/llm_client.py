@@ -31,7 +31,7 @@ class LLMClient:
     def __init__(
         self,
         base_url: str = "https://openrouter.ai/api/v1",
-        model: str = "deepseek/deepseek-v3.2",
+        model: str = "google/gemma-4-31b-it",
         api_key: str = "",
         timeout: int = 120,
         max_retries: int = 3,

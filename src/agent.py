@@ -42,7 +42,7 @@ class PurpleAgent:
     def __init__(
         self,
         model_base_url: str = "https://openrouter.ai/api/v1",
-        model_name: str = "deepseek/deepseek-v3.2",
+        model_name: str = "google/gemma-4-31b-it",
         hf_token: str = "",
         max_turns: int = 15,
         mcts_branches: int = 3,
