@@ -1,31 +1,27 @@
 """
 Purple Coding Agent — Complete Server
 ======================================
-Single-file implementation combining:
-  - A2A server (FastAPI, correct JSON-RPC + response format)
-  - MCTS engine (UCT-based action selection)
-  - Programmable PRM (3-layer reward scoring)
-  - Node State Manager (per-branch working set / discovery log)
-  - LLM Client (HuggingFace Router / OpenRouter / vLLM)
-  - Multi-turn session management
-
-A2A Protocol fixes applied:
-  1. Problem extracted from params.message.parts[].text (JSON-RPC format)
-  2. Response includes jsonrpc, contextId, artifactId, kind:"text"
+Key fixes in this version:
+  1. _extract_relevant_window: REMOVED line number prefixes (were breaking git apply)
+  2. fetch_relevant_files: test paths used only as HINTS, not fetched directly
+     Source files derived from test paths; tree search excludes cypress/e2e/stories
+  3. System prompt: removed "use line numbers" instruction (no numbers shown now)
+  4. Window stays at 80 lines but raw — model can copy context lines exactly
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
 import os
 import re
 import time
-import uuid
-import urllib.request
 import urllib.error
-import asyncio
+import urllib.parse
+import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,7 +54,6 @@ MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "6"))
 TEMPERATURE   = float(os.getenv("TEMPERATURE", "0.6"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
 
-# Correct chat completions URL (no double /v1)
 CHAT_URL = (
     f"{LLM_BASE_URL}/chat/completions"
     if "/v1" in LLM_BASE_URL
@@ -69,32 +64,25 @@ logger.info("=" * 60)
 logger.info("Purple Agent  model=%s", MODEL_NAME)
 logger.info("Chat URL      %s", CHAT_URL)
 logger.info("API Key       %s", "SET ✓" if API_KEY else "MISSING ✗")
-logger.info("GitHub Token  %s", "SET ✓" if GITHUB_TOKEN else "NOT SET (public repos only)")
+logger.info("GitHub Token  %s", "SET ✓" if GITHUB_TOKEN else "NOT SET")
 logger.info("MCTS          branches=%d  max_turns=%d  enabled=%s",
             MCTS_BRANCHES, MAX_TURNS, USE_MCTS)
 logger.info("=" * 60)
 
-#==============================================================================
-# GitHub file fetching 
-#==============================================================================
+
+# ==============================================================================
+# GITHUB FILE FETCHING
+# ==============================================================================
 
 def _github_headers() -> dict:
-    """Build headers for GitHub API calls."""
     h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if GITHUB_TOKEN:
         h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return h
- 
- 
+
+
 def fetch_file_raw(repo: str, ref: str, filepath: str) -> str:
-    """
-    FIX 1: Fetch raw file content using raw.githubusercontent.com.
-    This is simpler and more reliable than the Contents API.
-    Works for public repos without any auth token.
- 
-    URL: https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{filepath}
-    """
-    # ref can be a commit SHA or branch name; use HEAD if empty
+    """Fetch raw file content from raw.githubusercontent.com."""
     ref = ref or "HEAD"
     url = f"https://raw.githubusercontent.com/{repo}/{ref}/{filepath}"
     headers = {}
@@ -112,32 +100,7 @@ def fetch_file_raw(repo: str, ref: str, filepath: str) -> str:
     except Exception as e:
         logger.warning("GitHub fetch failed for %s: %s", filepath, e)
     return ""
- 
- 
-def search_github_for_file(repo: str, filename: str) -> list[str]:
-    """
-    FIX 2: Use GitHub Code Search API to find the actual path of a file
-    within the repository. Essential for monorepos where paths are deep.
- 
-    Returns a list of file paths found (e.g. ['packages/foo/bar/TotpInput.tsx'])
-    """
-    # Strip extension for broader search
-    name_no_ext = re.sub(r'\.\w+$', '', filename)
-    query = f"{name_no_ext} repo:{repo}"
-    url   = f"https://api.github.com/search/code?q={urllib.parse.quote(query)}&per_page=5"
- 
-    try:
-        import urllib.parse
-        req = urllib.request.Request(url, headers=_github_headers())
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data  = json.loads(r.read().decode())
-            items = data.get("items", [])
-            paths = [item["path"] for item in items]
-            logger.info("GitHub search '%s' → %s", filename, paths[:3])
-            return paths
-    except Exception as e:
-        logger.warning("GitHub search failed for '%s': %s", filename, e)
-        return []
+
 
 def get_repo_tree(repo: str, ref: str) -> list[str]:
     """Get all file paths in repo using Git Tree API."""
@@ -154,106 +117,143 @@ def get_repo_tree(repo: str, ref: str) -> list[str]:
     except Exception as e:
         logger.warning("Tree API failed for %s: %s", repo, e)
         return []
- 
- 
+
+
+# Directories and filename patterns to ALWAYS exclude when guessing source files
+_EXCLUDE_DIRS = {
+    "test", "tests", "spec", "specs", "mock", "mocks",
+    "vendor", "node_modules", "__pycache__", ".git",
+    "cypress", "e2e", "fixtures", "storybook", "stories",
+    "__tests__", "snapshots", "testdata", "testutil",
+    "example", "examples", "docs", "doc", "dist", "build",
+}
+
+_EXCLUDE_PATTERNS = re.compile(
+    r'(test|spec|mock|fixture|story|stories|e2e|cypress|snapshot|'
+    r'__tests__|testutil|testdata|_test)\.(py|go|js|ts|tsx|jsx)$',
+    re.IGNORECASE,
+)
+
+
+def _is_source_file(path: str) -> bool:
+    """Return True if the path looks like a source file (not test/fixture)."""
+    parts = path.lower().split("/")
+    # Exclude if any directory component is in exclude list
+    for part in parts[:-1]:
+        if part in _EXCLUDE_DIRS:
+            return False
+    # Exclude if filename matches test patterns
+    filename = parts[-1]
+    if _EXCLUDE_PATTERNS.search(filename):
+        return False
+    return True
+
+
+def _derive_source_paths_from_test(test_path: str) -> list[str]:
+    """
+    Given a test file path, guess the corresponding source file paths.
+    e.g. tests/test_foo.py → [foo.py, src/foo.py, lib/foo.py]
+         scanner/redhat_test.go → [scanner/redhat.go]
+         __tests__/Foo.test.ts → [Foo.ts, src/Foo.ts, components/Foo.ts]
+    """
+    candidates = []
+    dirname  = "/".join(test_path.split("/")[:-1])
+    filename = test_path.split("/")[-1]
+
+    # Go style: foo_test.go → foo.go (same directory)
+    if filename.endswith("_test.go"):
+        src_name = filename[:-len("_test.go")] + ".go"
+        candidates.append(f"{dirname}/{src_name}" if dirname else src_name)
+
+    # Python style: test_foo.py → foo.py
+    elif filename.startswith("test_") and filename.endswith(".py"):
+        src_name = filename[len("test_"):]
+        candidates.append(f"{dirname}/{src_name}" if dirname else src_name)
+        candidates.append(f"src/{src_name}")
+
+    # JS/TS style: Foo.test.ts → Foo.ts, Foo.spec.tsx → Foo.tsx
+    elif re.search(r'\.(test|spec)\.(ts|tsx|js|jsx)$', filename):
+        src_name = re.sub(r'\.(test|spec)(\.(ts|tsx|js|jsx))$', r'\2', filename)
+        if dirname:
+            # Remove test directory from path
+            src_dir = re.sub(r'(^|/)(__tests__|tests?|specs?)(/|$)', '/', dirname)
+            src_dir = src_dir.strip("/")
+            candidates.append(f"{src_dir}/{src_name}" if src_dir else src_name)
+        candidates.append(f"src/{src_name}")
+
+    return [c for c in candidates if c]
+
+
 def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
     """
-    FIX 3: Improved file fetching strategy:
-    1. Extract candidate filenames from problem statement and test paths
-    2. Try direct fetch first (if full path known)
-    3. Fall back to GitHub Search API to find actual path in repo
-    Returns {filepath: content} for up to 6 files.
+    Fetch actual source file content from GitHub.
+
+    Strategy:
+    1. Try full paths explicitly mentioned in problem statement
+    2. Derive source paths from test paths (test_foo.py → foo.py)
+    3. Fall back to tree API + keyword ranking (excluding test/cypress/etc.)
     """
     if not task.repo:
         return {}
- 
-    ref = task.base_commit or "HEAD"
- 
-    # ── Collect candidate paths ───────────────────────────────────────────────
- 
-    # From test paths (most reliable — these ARE real paths)
-    test_paths: list[str] = []
-    for test in task.fail_to_pass[:6]:
-        test_file = test.split("::")[0]
-        test_paths.append(test_file)
- 
-    # From problem statement: full paths (e.g. `lib/foo/bar.py`)
+
+    ref   = task.base_commit or "HEAD"
+    files: dict[str, str] = {}
+
+    # 1. Full paths from problem statement (most reliable)
     ps_full_paths = re.findall(
-        r'(?:^|[\s`"\'])('
+        r'(?:^|[\s`"\'(])('
         r'[\w][\w/.-]+\.(?:py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h|php|cs|swift|kt)'
         r')',
         task.problem_statement,
         re.MULTILINE,
     )
-    ps_full_paths = [p.strip() for p in ps_full_paths][:5]
- 
-    # From problem statement: bare filenames in backticks
-    ps_filenames = re.findall(
-        r'`([\w.-]+\.(?:py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h|php|cs|swift|kt))`',
-        task.problem_statement,
-    )[:5]
- 
-    # ── Attempt fetches ───────────────────────────────────────────────────────
- 
-    files: dict[str, str] = {}
- 
-    # Try test paths first — they are real paths
-    for fp in test_paths:
-        if fp and len(files) < 6:
-            content = fetch_file_raw(task.repo, ref, fp)
-            if content:
-                files[fp] = content
- 
-    # Try full paths from problem statement
-    for fp in ps_full_paths:
-        if fp and len(files) < 6:
-            content = fetch_file_raw(task.repo, ref, fp)
-            if content:
-                files[fp] = content
- 
-    # For bare filenames: search the repo to find actual path
-    import urllib.parse
-    for filename in ps_filenames:
-        if len(files) >= 6:
-            break
-        if any(filename in fp for fp in files):
-            continue  # already fetched
-        found_paths = search_github_for_file(task.repo, filename)
-        for fp in found_paths[:2]:
-            if len(files) >= 6:
-                break
+    for fp in [p.strip() for p in ps_full_paths][:5]:
+        if fp and len(files) < 6 and _is_source_file(fp):
             content = fetch_file_raw(task.repo, ref, fp)
             if content:
                 files[fp] = content
 
-    # If < 2 files, use tree API + keyword matching
+    # 2. Derive source file paths from test paths in fail_to_pass
+    for test in task.fail_to_pass[:4]:
+        test_file = test.split("::")[0]
+        derived   = _derive_source_paths_from_test(test_file)
+        for fp in derived:
+            if len(files) >= 6:
+                break
+            if fp not in files:
+                content = fetch_file_raw(task.repo, ref, fp)
+                if content:
+                    files[fp] = content
+
+    # 3. Tree API fallback — only when we have fewer than 2 files
     if len(files) < 2:
         tree = get_repo_tree(task.repo, ref)
         if tree:
-            # Score paths by keyword overlap with problem statement
-            ps_words = set(re.findall(r'\b\w{3,}\b', 
-                                       task.problem_statement.lower()))
+            ps_words = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
+
             def path_score(p: str) -> int:
-                p_words = set(re.findall(r'\b\w{3,}\b', p.lower()))
+                p_words = set(re.findall(r'\b\w{4,}\b', p.lower()))
                 return len(ps_words & p_words)
 
-            # Filter to source files only, rank by relevance
-            src_files = [p for p in tree 
-                         if re.search(r'\.(py|go|js|ts|tsx|jsx|rb|java|rs)$', p)
-                         and not any(x in p for x in 
-                                     ['test', 'spec', 'mock', 'vendor', 'node_modules'])]
+            # Strict source-only filter
+            src_files = [
+                p for p in tree
+                if re.search(r'\.(py|go|js|ts|tsx|jsx|rb|java|rs|c|cpp|h)$', p)
+                and _is_source_file(p)
+            ]
             ranked = sorted(src_files, key=path_score, reverse=True)
 
-            for fp in ranked[:4]:
+            for fp in ranked[:6]:
                 if len(files) >= 6:
                     break
                 if fp not in files:
                     content = fetch_file_raw(task.repo, ref, fp)
                     if content:
                         files[fp] = content
- 
+
     logger.info("Fetched %d files from GitHub for %s", len(files), task.repo)
     return files
+
 
 # ==============================================================================
 # MCTS ENGINE
@@ -265,9 +265,9 @@ EXPLORATION_C = math.sqrt(2)
 @dataclass
 class MCTSNode:
     state: dict
-    parent: MCTSNode | None = None
+    parent: "MCTSNode | None" = None
     action: dict | None = None
-    children: list[MCTSNode] = field(default_factory=list)
+    children: list["MCTSNode"] = field(default_factory=list)
     _visits: int = 0
     _value_sum: float = 0.0
 
@@ -286,10 +286,8 @@ class MCTSNode:
         self._visits += 1
         self._value_sum += reward
 
-    def best_child(self) -> MCTSNode | None:
-        if not self.children:
-            return None
-        return max(self.children, key=lambda c: c.uct(self._visits))
+    def best_child(self) -> "MCTSNode | None":
+        return max(self.children, key=lambda c: c.uct(self._visits)) if self.children else None
 
     def is_leaf(self) -> bool:
         return not self.children
@@ -297,29 +295,21 @@ class MCTSNode:
 
 class MCTSEngine:
     def __init__(self, root: MCTSNode, branches: int = 6):
-        self.root = root
+        self.root     = root
         self.branches = branches
         self._current = root
         self._pending: MCTSNode | None = None
 
-    def select_action(
-        self, candidates: list[tuple[dict, float]]
-    ) -> tuple[dict, MCTSNode]:
+    def select_action(self, candidates: list[tuple[dict, float]]) -> tuple[dict, MCTSNode]:
         for action, score in candidates:
-            child = MCTSNode(
-                state=self._current.state.copy(),
-                parent=self._current,
-                action=action,
-            )
+            child = MCTSNode(state=self._current.state.copy(),
+                             parent=self._current, action=action)
             child.update(score)
             self._current.children.append(child)
-
         best = self._current.best_child()
         if best is None:
             return candidates[0][0], self._current
-
         self._pending = best
-        logger.debug("MCTS select action=%s uct=%.3f", best.action.get("action"), best.uct(self._current._visits))
         return best.action, best
 
     def backpropagate(self, reward: float):
@@ -333,8 +323,8 @@ class MCTSEngine:
 
     def stats(self) -> dict:
         return {
-            "nodes": self._count(self.root),
-            "depth": self._depth(self._current),
+            "nodes":      self._count(self.root),
+            "depth":      self._depth(self._current),
             "root_value": round(self.root.value, 3),
         }
 
@@ -352,27 +342,19 @@ class MCTSEngine:
 
 
 # ==============================================================================
-# PROGRAMMABLE PRM (Process Reward Model)
+# PROGRAMMABLE PRM
 # ==============================================================================
 
 class ProgrammablePRM:
-    """
-    Three-layer reward scoring:
-      Hard  (20%) — format validity
-      Soft  (35%) — relevance to problem
-      Exec  (45%) — execution signals from observation
-    """
-
-    def score_static(self, action: dict, task: SWETask) -> float:
+    def score_static(self, action: dict, task: "SWETask") -> float:
         a = action.get("action", "bash")
         c = action.get("content", "")
-        score = 0.20 * self._format(a, c) + 0.35 * self._relevance(c, task)
-        return min(score, 1.0)
+        return min(0.20 * self._format(a, c) + 0.35 * self._relevance(c, task), 1.0)
 
-    def score_observation(self, obs: dict, task: SWETask) -> float:
+    def score_observation(self, obs: dict, task: "SWETask") -> float:
         stdout = obs.get("stdout", "")
         stderr = obs.get("stderr", "")
-        score  = 0.3  # baseline
+        score  = 0.30
         score += 0.45 * self._exec(stdout, stderr, task)
         score += 0.15 * self._discovery(stdout, task)
         if stderr and not stdout:
@@ -386,10 +368,10 @@ class ProgrammablePRM:
             has_header = "diff --git" in content or "--- a/" in content
             has_hunk   = "@@" in content
             has_change = bool(re.search(r'^\+', content, re.MULTILINE))
-            return (0.4 * has_header) + (0.3 * has_hunk) + (0.3 * has_change)
+            return 0.4 * has_header + 0.3 * has_hunk + 0.3 * has_change
         return 1.0 if len(content) < 500 else 0.5
 
-    def _relevance(self, content: str, task: SWETask) -> float:
+    def _relevance(self, content: str, task: "SWETask") -> float:
         if not task.problem_statement:
             return 0.5
         ps_tok = set(re.findall(r"\b\w{4,}\b", task.problem_statement.lower()))
@@ -398,7 +380,7 @@ class ProgrammablePRM:
             return 0.5
         return min(len(ps_tok & ct_tok) / len(ps_tok) * 2, 1.0)
 
-    def _exec(self, stdout: str, stderr: str, task: SWETask) -> float:
+    def _exec(self, stdout: str, stderr: str, task: "SWETask") -> float:
         sl = stdout.lower()
         if re.search(r"\d+ passed", sl) and "failed" not in sl:
             return 1.0
@@ -410,20 +392,20 @@ class ProgrammablePRM:
             return 0.2
         return 0.4
 
-    def _discovery(self, stdout: str, task: SWETask) -> float:
-        files = re.findall(r'[\w/.-]+\.py(?::\d+)?', stdout)
+    def _discovery(self, stdout: str, task: "SWETask") -> float:
+        files = re.findall(r'[\w/.-]+\.(?:py|go|ts|tsx|js)(?::\d+)?', stdout)
         if not files:
             return 0.0
         ps_lower = task.problem_statement.lower()
         for fp in files:
-            base = fp.split("/")[-1].replace(".py", "")
-            if base in ps_lower:
+            base = re.split(r'[/.]', fp)[-2] if '.' in fp else fp
+            if base.lower() in ps_lower:
                 return 1.0
         return 0.5
 
 
 # ==============================================================================
-# NODE STATE MANAGER
+# NODE STATE
 # ==============================================================================
 
 @dataclass
@@ -433,7 +415,7 @@ class NodeState:
     discovery_log: dict[str, str] = field(default_factory=dict)
     current_patch: str = ""
 
-    def copy(self) -> NodeState:
+    def copy(self) -> "NodeState":
         return NodeState(
             cwd=self.cwd,
             working_set=list(self.working_set),
@@ -451,11 +433,9 @@ class NodeState:
             parts.append("Open files: " + ", ".join(self.working_set[-5:]))
         if self.discovery_log:
             parts.append("Discoveries:")
-            for loc, fact in list(self.discovery_log.items())[-6:]:
+            for loc, fact in list(self.discovery_log.items())[-5:]:
                 parts.append(f"  • {loc}: {fact}")
-        if self.current_patch:
-            parts.append(f"Current patch: {len(self.current_patch.splitlines())} lines")
-        return "\n".join(parts) or "No state yet."
+        return "\n".join(parts) if parts else ""
 
 
 # ==============================================================================
@@ -476,77 +456,6 @@ class SWETask:
 
 
 # ==============================================================================
-# PROMPTS
-# ==============================================================================
-
-SYSTEM_PROMPT = """\
-You are a world-class software engineer debugging a real GitHub issue.
-
-You have access to an interactive shell in the project repository.
-You work in three modes:
-
-  bash   — Read-only exploration (find, grep, cat, git log, python -c, pytest)
-  debug  — Temporary writes + execution to verify hypotheses
-  patch  — Submit the final unified diff that fixes the bug
-
-ALWAYS respond in this XML format:
-
-<thought>
-Step-by-step analysis. Reference specific file names, line numbers, functions.
-Verify your reasoning before acting.
-</thought>
-<command>bash|debug|patch</command>
-<content>
-the shell command OR unified diff here
-</content>
-
-RULES:
-1. Start with: find /workspace/repo -type f -name "*.py" | head -30
-2. Read relevant files with cat -n to see line numbers
-3. Run failing tests: python -m pytest <test_path> -x --tb=short
-4. Only switch to patch mode when confident
-5. Patch must be valid unified diff (git diff format), starting with diff --git
-6. Never use rm, dd, or destructive commands
-"""
-
-
-def build_user_prompt(task: SWETask) -> str:
-    lines = ["# Bug Report", "", task.problem_statement.strip()]
-    if task.hints_text:
-        lines += ["", "## Hints", task.hints_text.strip()]
-    if task.fail_to_pass:
-        lines += ["", "## Tests That Must Pass After Fix"]
-        lines += [f"  - {t}" for t in task.fail_to_pass]
-    lines += [
-        "", "## Environment",
-        f"  Working directory : {task.cwd}",
-        f"  Python version    : {task.python_version}",
-        "", "Begin your exploration. Output your first action.",
-    ]
-    return "\n".join(lines)
-
-
-def build_obs_prompt(obs: dict) -> str:
-    parts = []
-    cwd = obs.get("cwd", "")
-    if cwd:
-        parts.append(f"[cwd: {cwd}]")
-    stdout = obs.get("stdout", "").strip()
-    stderr = obs.get("stderr", "").strip()
-    if stdout:
-        if len(stdout) > 3000:
-            stdout = stdout[:1500] + "\n…[truncated]…\n" + stdout[-400:]
-        parts.append(f"stdout:\n```\n{stdout}\n```")
-    if stderr:
-        if len(stderr) > 800:
-            stderr = stderr[:400] + "\n…[truncated]…\n" + stderr[-200:]
-        parts.append(f"stderr:\n```\n{stderr}\n```")
-    if not stdout and not stderr:
-        parts.append("(no output)")
-    return "\n".join(parts) + "\n\nWhat is your next action?"
-
-
-# ==============================================================================
 # LLM CLIENT
 # ==============================================================================
 
@@ -557,7 +466,7 @@ class LLMClient:
             self._headers["Authorization"] = f"Bearer {API_KEY}"
             logger.info("LLM auth token set ✓")
         else:
-            logger.warning("LLM: no API token — calls will 401")
+            logger.warning("LLM: no API token — calls will fail")
 
     def complete(
         self,
@@ -566,31 +475,26 @@ class LLMClient:
         max_tokens: int = 2048,
     ) -> str:
         payload: dict[str, Any] = {
-            "model": MODEL_NAME,
-            "messages": messages,
+            "model":       MODEL_NAME,
+            "messages":    messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens":  max_tokens,
         }
         for attempt in range(1, 4):
             try:
                 resp = requests.post(
-                    CHAT_URL,
-                    json=payload,
-                    headers=self._headers,
-                    timeout=90,
+                    CHAT_URL, json=payload, headers=self._headers, timeout=90
                 )
+                logger.info("LLM status: %d", resp.status_code)
                 if resp.status_code == 401:
-                    logger.error("LLM 401 Unauthorized — check OPENROUTER_API_KEY secret")
+                    logger.error("LLM 401 — check OPENROUTER_API_KEY secret")
                     return ""
                 if resp.status_code == 429:
-                    wait = 5 * attempt
-                    logger.warning("LLM 429 rate limited — waiting %ds", wait)
-                    time.sleep(wait)
+                    time.sleep(5 * attempt)
                     continue
                 if resp.status_code != 200:
-                    logger.error("LLM %d: %s", resp.status_code, resp.text[:200])
+                    logger.error("LLM %d: %s", resp.status_code, resp.text[:300])
                     return ""
-                resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"]
                 logger.info("LLM status=200 returned %d chars", len(content))
                 return content
@@ -599,45 +503,35 @@ class LLMClient:
                 if attempt < 3:
                     time.sleep(2 ** attempt)
                 else:
-                    logger.error("All LLM retries exhausted")
                     return ""
         return ""
 
 
 # ==============================================================================
-# PURPLE AGENT (MCTS ORCHESTRATOR)
+# PURPLE AGENT
 # ==============================================================================
 
 class PurpleAgent:
-    """
-    Stateful agent — one session per instance_id.
-    Each call to respond() handles one A2A turn.
-    """
-
     def __init__(self):
-        self.llm  = LLMClient()
-        self.prm  = ProgrammablePRM()
+        self.llm      = LLMClient()
+        self.prm      = ProgrammablePRM()
         self._sessions: dict[str, dict[str, Any]] = {}
 
-    async def respond(self, message: dict) -> dict:
+    def respond(self, message: dict) -> dict:
         session_id = (
             message.get("session_id")
             or message.get("instance_id")
             or str(abs(hash(message.get("problem_statement", "")[:80])))
         )
-
         if session_id not in self._sessions:
             session = self._init_session(session_id, message)
         else:
             session = self._sessions[session_id]
-
         try:
-            return await self._step(session, message)
+            return self._step_sync(session, message)
         except Exception as e:
             logger.exception("[%s] Agent step crashed: %s", session_id, e)
             return {"action": "patch", "content": ""}
-
-    # ── Session Init ──────────────────────────────────────────────────────────
 
     def _init_session(self, session_id: str, message: dict) -> dict:
         task = SWETask(
@@ -649,30 +543,34 @@ class PurpleAgent:
             pass_to_pass=message.get("pass_to_pass", []) or [],
             repo=message.get("repo", ""),
             instance_id=message.get("instance_id", ""),
-            base_commit=message.get("base_commit", "")
+            base_commit=message.get("base_commit", ""),
         )
-        root = MCTSNode(state=NodeState(cwd=task.cwd).__dict__)
+        root    = MCTSNode(state={"cwd": task.cwd})
         session = {
-            "id": session_id,
-            "task": task,
-            "mcts": MCTSEngine(root, branches=MCTS_BRANCHES),
-            "node_state": NodeState(cwd=task.cwd),
-            "turn": 0,
-            "history": [],
+            "id":              session_id,
+            "task":            task,
+            "mcts":            MCTSEngine(root, branches=MCTS_BRANCHES),
+            "node_state":      NodeState(cwd=task.cwd),
+            "turn":            0,
+            "history":         [],
             "submitted_patch": None,
-            "_fetched_files": None,
+            "_fetched_files":  None,
         }
         self._sessions[session_id] = session
-        logger.info("[%s] New session repo=%s", session_id, task.repo)
+        logger.info("[%s] New session repo=%s commit=%s",
+                    session_id[:20], task.repo,
+                    task.base_commit[:12] if task.base_commit else "HEAD")
         return session
 
-    # ── Step ──────────────────────────────────────────────────────────────────
+    def _step_sync(self, session: dict, message: dict) -> dict:
+        """Synchronous entry point — runs async _step in event loop."""
+        return asyncio.run(self._step(session, message))
+
     async def _step(self, session: dict, message: dict) -> dict:
         task: SWETask = session["task"]
         session["turn"] += 1
         turn = session["turn"]
- 
-        # Record observation from green agent
+
         if "stdout" in message or "stderr" in message:
             obs = {
                 "cwd":    message.get("cwd", task.cwd),
@@ -683,67 +581,23 @@ class PurpleAgent:
                 session["history"][-1]["observation"] = obs
                 score = self.prm.score_observation(obs, task)
                 session["mcts"].backpropagate(score)
-                logger.info("[%s] turn=%d PRM=%.3f", session["id"], turn, score)
- 
-                # Update node state from observation
                 self._update_state(session["node_state"], obs)
- 
-        # Force patch when nearing turn limit
+                logger.info("[%s] turn=%d PRM=%.3f", session["id"][:20], turn, score)
+
         if turn >= MAX_TURNS - 1 and not session["submitted_patch"]:
-            logger.info("[%s] Forcing patch (turn limit)", session["id"])
+            logger.info("[%s] Final turn — forcing patch", session["id"][:20])
             return self._force_patch(session)
- 
-        # Select action
+
         if USE_MCTS:
             action = await self._mcts_patch(session)
         else:
             action = self._greedy_patch(session)
- 
+
         session["history"].append({"action": action})
-        logger.info("[%s] turn=%d action=%s", session["id"], turn, action.get("action"))
-        return action
-    
-    # ── Action Selection ──────────────────────────────────────────────────────
-
-    def _greedy_action(self, session: dict) -> dict:
-        msgs = self._build_messages(session)
-        raw  = self.llm.complete(msgs, temperature=TEMPERATURE, max_tokens=1024)
-        return self._parse_action(raw, session)
-
-    def _mcts_action(self, session: dict) -> dict:
-        msgs = self._build_messages(session)
-        candidates = []
-        for _ in range(MCTS_BRANCHES):
-            raw    = self.llm.complete(msgs, temperature=TEMPERATURE + 0.1, max_tokens=1024)
-            action = self._parse_action(raw, session)
-            score  = self.prm.score_static(action, session["task"])
-            candidates.append((action, score))
-            logger.info("[%s] MCTS branch %d/%d action=%s score=%.3f", session["id"][:20], _ + 1, MCTS_BRANCHES, action.get("action"), score)
-
-        best, _ = session["mcts"].select_action(candidates)
-        logger.info("MCTS stats: %s", session["mcts"].stats())
-        return best
-
-    def _force_patch(self, session: dict) -> dict:
-        task    = session["task"]
-        history = self._format_history(session["history"])
-        msgs    = [
-            {"role": "system", "content": "You are an expert software engineer. Output ONLY a unified diff patch starting with diff --git. No explanation."},
-            {"role": "user",   "content": f"Based on exploration:\n{history}\n\nFix:\n{task.problem_statement[:600]}"},
-        ]
-        raw = self.llm.complete(msgs, temperature=0.15, max_tokens=2048)
-        action = self._parse_action(raw, session)
-        if action.get("action") != "patch":
-            content = action.get("content", "")
-            action  = {
-                "action":  "patch",
-                "content": content if ("diff --git" in content or "--- a/" in content) else "",
-            }
-        session["submitted_patch"] = action["content"]
+        logger.info("[%s] turn=%d action=%s", session["id"][:20], turn, action.get("action"))
         return action
 
     def _greedy_patch(self, session: dict) -> dict:
-        """Single-shot patch generation."""
         msgs = self._build_patch_messages(session)
         raw  = self.llm.complete(msgs, temperature=0.2, max_tokens=2048)
         return self._force_to_patch(raw, session)
@@ -755,7 +609,7 @@ class PurpleAgent:
             asyncio.to_thread(
                 self.llm.complete, msgs,
                 temperature=0.2 + i * 0.15,
-                max_tokens=2048
+                max_tokens=2048,
             )
             for i in range(MCTS_BRANCHES)
         ]
@@ -775,42 +629,64 @@ class PurpleAgent:
         session["mcts"].backpropagate(best_score)
         return best_action
 
+    def _force_patch(self, session: dict) -> dict:
+        task    = session["task"]
+        history = self._format_history(session["history"])
+        msgs    = [
+            {"role": "system", "content":
+             "You are an expert software engineer. "
+             "Output ONLY a unified diff starting with diff --git. No explanation."},
+            {"role": "user", "content":
+             f"Exploration so far:\n{history}\n\nFix:\n{task.problem_statement[:600]}"},
+        ]
+        raw    = self.llm.complete(msgs, temperature=0.15, max_tokens=2048)
+        action = self._force_to_patch(raw, session)
+        if action.get("action") != "patch":
+            action = {"action": "patch", "content": ""}
+        session["submitted_patch"] = action["content"]
+        return action
+
     def _build_patch_messages(self, session: dict) -> list[dict]:
         task = session["task"]
- 
-        # Fetch files once per session (cached), not once per MCTS branch
+
+        # Fetch files once per session (cached)
         if session["_fetched_files"] is None:
             session["_fetched_files"] = fetch_relevant_files(task)
         real_files = session["_fetched_files"]
- 
-        # FIX 4: Build system prompt WITHOUT leading indentation
-        # The old version used f"""...""" with indented lines — this added
-        # spaces to every line which confused the model.
+
         if real_files:
             file_sections = []
             for filepath, content in real_files.items():
-                lines = content.splitlines()
-                if len(lines) > 150:
-                    content = self._extract_relevant_window(content, task, window=150)
-                    
-                file_sections.append(f"### {filepath}\n```\n{content}\n```")
-            file_context = "\n\n## ACTUAL FILE CONTENTS\nUse EXACTLY these lines for your diff:\n\n" + "\n\n".join(file_sections)
-            logger.info("[%s] Providing %d real files to model", session["id"][:20], len(real_files))
+                # FIX: NO LINE NUMBERS — show raw content only
+                # Line numbers were being copied into diff context lines,
+                # causing every git apply to fail with context mismatch.
+                displayed = self._extract_relevant_window(content, task, window=80)
+                file_sections.append(f"### {filepath}\n```\n{displayed}\n```")
+            file_context = (
+                "\n\n## ACTUAL FILE CONTENTS\n"
+                "Copy context lines EXACTLY as shown — character for character:\n\n"
+                + "\n\n".join(file_sections)
+            )
+            logger.info("[%s] Providing %d real files to model",
+                        session["id"][:20], len(real_files))
         else:
-            file_context = "\n\n## NOTE\nCould not fetch file content from GitHub. Infer from the issue description and test file paths."
-            logger.warning("[%s] No files fetched — model working blind", session["id"][:20])
- 
-        # Build test hints
+            file_context = (
+                "\n\n## NOTE\n"
+                "File content unavailable. Infer from the issue and test paths."
+            )
+            logger.warning("[%s] No files fetched — model working blind",
+                           session["id"][:20])
+
         test_hint = ""
         if task.fail_to_pass:
-            test_hint = "\n\nFailing tests (these must pass after your fix):\n" + "\n".join(
+            test_hint = "\n\nFailing tests:\n" + "\n".join(
                 f"  - {t}" for t in task.fail_to_pass[:5]
             )
- 
+
         hints_hint = ""
         if task.hints_text:
-            hints_hint = f"\n\nHints from issue tracker:\n{task.hints_text[:400]}"
- 
+            hints_hint = f"\n\nHints:\n{task.hints_text[:400]}"
+
         system = (
             "You are an expert software engineer fixing a real GitHub issue.\n"
             f"Repository: {task.repo}\n"
@@ -819,12 +695,12 @@ class PurpleAgent:
             "\n"
             "CRITICAL RULES:\n"
             "1. Output ONLY a valid unified diff starting exactly with: diff --git\n"
-            "2. Copy context lines CHARACTER-FOR-CHARACTER from the file shown above\n"
-            "   Even one space difference will break git apply\n"
-            "3. Change MAXIMUM 10 lines — make the smallest possible fix\n"
-            "4. Use the line numbers shown (e.g. '  42: code') for the @@ header\n"
-            "5. Include exactly 3 unchanged context lines before and after each change\n"
-            "6. Do NOT include <think> tags, explanations, or markdown fences\n"
+            "2. Copy context lines CHARACTER-FOR-CHARACTER from the files above\n"
+            "   DO NOT paraphrase or reformat context lines even slightly\n"
+            "   One space difference will break git apply\n"
+            "3. Change MAXIMUM 10 lines — minimal fix only\n"
+            "4. Include exactly 3 unchanged context lines before and after changes\n"
+            "5. Do NOT include <think> tags, explanations, or markdown fences\n"
             "\n"
             "DIFF FORMAT:\n"
             "diff --git a/path/file.go b/path/file.go\n"
@@ -840,107 +716,90 @@ class PurpleAgent:
             " exact context line from file\n"
             " exact context line from file\n"
         )
- 
-        user = f"Fix this GitHub issue:\n\n{task.problem_statement[:2500]}{test_hint}{hints_hint}"
- 
+
+        user = (
+            f"Fix this GitHub issue:\n\n{task.problem_statement[:2500]}"
+            f"{test_hint}{hints_hint}"
+        )
+
         return [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ]
-    
-    def _extract_relevant_window(self, content: str, task: SWETask, 
+
+    def _extract_relevant_window(self, content: str, task: SWETask,
                                   window: int = 80) -> str:
-        """Find the most relevant window of lines using keyword matching."""
+        """
+        Find the most relevant window of lines using keyword matching.
+
+        FIX: Returns RAW lines with NO line number prefixes.
+        Previous version added '  42: ' prefix to every line, which the model
+        then copied into diff context lines, making git apply fail 100% of the time.
+        """
         lines = content.splitlines()
         if len(lines) <= window:
-            return "\n".join(f"{i+1:4d}: {line}" for i, line in enumerate(lines))
+            # File fits entirely — show all of it, raw
+            return content
 
-        # Keywords from problem statement + test names
+        # Keywords from problem statement + test function names
         keywords = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
         for test in task.fail_to_pass:
             func = test.split("::")[-1] if "::" in test else ""
             if func:
-                keywords.add(func.lower())
+                keywords.update(re.findall(r'\b\w{4,}\b', func.lower()))
 
         # Score each line by keyword density
-        scores = []
-        for i, line in enumerate(lines):
-            line_words = set(re.findall(r'\b\w{4,}\b', line.lower()))
-            scores.append(len(keywords & line_words))
+        scores = [
+            len(keywords & set(re.findall(r'\b\w{4,}\b', line.lower())))
+            for line in lines
+        ]
 
-        # Find the window with highest total score
+        # Find the window with highest total keyword score
         best_start = 0
         best_score = -1
-        for start in range(0, len(lines) - window, 10):
-            window_score = sum(scores[start:start + window])
-            if window_score > best_score:
-                best_score = window_score
+        step = max(1, len(lines) // 20)  # check ~20 positions
+        for start in range(0, max(1, len(lines) - window), step):
+            ws = sum(scores[start:start + window])
+            if ws > best_score:
+                best_score = ws
                 best_start = start
 
         selected = lines[best_start:best_start + window]
-        numbered = "\n".join(
-            f"{best_start + i + 1:4d}: {line}" 
-            for i, line in enumerate(selected)
-        )
-        return f"[Showing lines {best_start+1}-{best_start+window} of {len(lines)}]\n{numbered}"
 
+        # Header shows line range for reference (NOT prepended to each line)
+        header = f"[Lines {best_start+1}-{best_start+len(selected)} of {len(lines)} total]\n"
+        return header + "\n".join(selected)
 
     def _force_to_patch(self, raw: str, session: dict) -> dict:
-        """Parse LLM output and force it into patch format."""
         raw = raw.strip()
+        # Strip DeepSeek <think> blocks
         raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         # Strip markdown fences
         m = None
         if "```" in raw:
-           m = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
-        if m:
-           raw = m.group(1).strip()
+            m = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
+            if m:
+                raw = m.group(1).strip()
         # Find diff block
         if not (raw.startswith("diff --git") or raw.startswith("--- ")):
-           m = re.search(r"(diff --git.*)", raw, re.DOTALL)
-           raw = m.group(1).strip() if m else ""
+            m = re.search(r"(diff --git.*)", raw, re.DOTALL)
+            raw = m.group(1).strip() if m else ""
         if raw:
-           logger.info("[%s] Valid patch extracted (%d chars)", session["id"][:20], len(raw))
+            logger.info("[%s] Valid patch extracted (%d chars)",
+                        session["id"][:20], len(raw))
         else:
-           logger.warning("[%s] No valid diff found in LLM output", session["id"][:20])
+            logger.warning("[%s] No valid diff in LLM output", session["id"][:20])
         return {"action": "patch", "content": raw}
-
-    # ── Prompt Construction ───────────────────────────────────────────────────
-
-    def _build_messages(self, session: dict) -> list[dict]:
-        task    = session["task"]
-        history = session["history"]
-        state   = session["node_state"]
-        system  = "You are a software engineer. Fix the bug described."
-        summary = state.summarize()
-        if summary:
-            system += f"\n\nCurrent state:\n{summary}"
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": task.problem_statement[:2000]},
-        ]
-        for entry in history:
-            action = entry.get("action", {})
-            messages.append({
-                "role":    "assistant",
-                "content": f"<command>{action.get('action','bash')}</command>\n<content>{action.get('content','')}</content>",
-            })
-            obs = entry.get("observation")
-            if obs:
-                messages.append({"role": "user", "content": str(obs)[:1000]})
-        return messages
-
-    # ── State Update ──────────────────────────────────────────────────────────
 
     def _update_state(self, state: NodeState, obs: dict):
         state.cwd = obs.get("cwd", state.cwd)
         stdout    = obs.get("stdout", "")
-        for fpath, lineno in re.findall(r'([\w/.-]+\.py)(?::(\d+))?', stdout)[:8]:
+        for fpath, lineno in re.findall(
+            r'([\w/.-]+\.(?:py|go|ts|tsx|js))(?::(\d+))?', stdout
+        )[:8]:
             state.add_file(fpath)
             if lineno:
                 state.discovery_log[f"{fpath}:{lineno}"] = "referenced in output"
-
-    # ── Parsing ───────────────────────────────────────────────────────────────
 
     def _parse_action(self, raw: str, session: dict) -> dict:
         raw     = raw.strip()
@@ -949,7 +808,6 @@ class PurpleAgent:
         if command not in ("bash", "debug", "patch"):
             command = "patch" if ("diff --git" in content or "--- a/" in content) else "bash"
         return {"action": command, "content": content}
- 
 
     @staticmethod
     def _tag(text: str, tag: str) -> str | None:
@@ -977,10 +835,7 @@ agent = PurpleAgent()
 
 AGENT_CARD = {
     "name": "Purple Coding Agent",
-    "description": (
-        "MCTS-guided software engineering agent for SWE-bench Pro. "
-        "Powered by DeepSeek V3.2 + GitHub context."
-    ),
+    "description": "MCTS-guided SWE-bench agent. DeepSeek V3 + GitHub context.",
     "url": f"http://localhost:{PORT}/",
     "version": "1.0.0",
     "capabilities": {
@@ -994,7 +849,7 @@ AGENT_CARD = {
         {
             "id": "swe_patch",
             "name": "SWE Patch",
-            "description": "Explore a codebase and return a unified git diff patch.",
+            "description": "Fix a GitHub issue and return a unified git diff patch.",
             "tags": ["coding", "swe-bench", "patch"],
             "examples": [],
         }
@@ -1020,51 +875,40 @@ async def health():
 @app.post("/")
 async def handle_task(request: Request):
     body = await request.json()
- 
+
     jsonrpc_id  = body.get("id", str(uuid.uuid4()))
     task_id     = str(uuid.uuid4())
     artifact_id = str(uuid.uuid4())
- 
+
     logger.info("─" * 50)
     logger.info("Request id=%s method=%s", jsonrpc_id, body.get("method"))
- 
+
     task_data, context_id = _extract_task_and_context(body)
     if not context_id:
         context_id = str(uuid.uuid4())
- 
+
     task_data["session_id"] = context_id
- 
+
     ps = task_data.get("problem_statement", "")
     logger.info("context_id=%s ps_len=%d repo=%s commit=%s",
                 context_id[:20], len(ps),
                 task_data.get("repo", "?"),
-                task_data.get("base_commit", "")[:12] or "HEAD")
- 
-    action        = await agent.respond(task_data)
-    artifact_text = action.get("content", "") 
+                (task_data.get("base_commit", "") or "")[:12] or "HEAD")
 
-    # If action is bash/debug or content is empty, 
-    # make one final direct LLM call for a patch
-    if action.get("action") != "patch" or not artifact_text.strip():
-        logger.warning("Non-patch action returned — making emergency patch call")
-        ps = task_data.get("problem_statement", "")[:2000]
-        repo = task_data.get("repo", "")
-        emergency_msgs = [
-            {"role": "system", "content": 
-             "Output ONLY a unified diff starting with diff --git. No explanation."},
-            {"role": "user", "content": 
-             f"Repository: {repo}\n\nFix this issue:\n{ps}"},
-        ]
-        raw = await asyncio.to_thread(
-            agent.llm.complete, emergency_msgs, 0.3, 2048
-        )
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-        m   = re.search(r'(diff --git.*)', raw, re.DOTALL)
-        artifact_text = m.group(1).strip() if m else ""
-        logger.info("Emergency patch: %d chars", len(artifact_text))
- 
-    
- 
+    # Run agent — respond() calls asyncio.run() internally for _mcts_patch
+    import concurrent.futures
+    loop   = asyncio.get_event_loop()
+    action = await loop.run_in_executor(None, agent.respond, task_data)
+
+    artifact_text = (
+        action.get("content", "")
+        if action.get("action") == "patch"
+        else json.dumps(action)
+    )
+
+    logger.info("Response: action=%s artifact_len=%d",
+                action.get("action"), len(artifact_text))
+
     return JSONResponse(content={
         "jsonrpc": "2.0",
         "id":      jsonrpc_id,
@@ -1089,47 +933,50 @@ async def handle_task(request: Request):
 
 def _extract_task_and_context(body: dict) -> tuple[dict, str]:
     context_id = ""
- 
+
     if "problem_statement" in body:
         return body, context_id
- 
+
     try:
         params     = body.get("params", {})
         message    = params.get("message", {})
         context_id = message.get("contextId", "") or params.get("contextId", "")
- 
+
         parts = message.get("parts", [])
-        logger.info("Parts: %d  contextId=%s", len(parts), context_id[:20] if context_id else "none")
- 
+        logger.info("Parts: %d  contextId=%s",
+                    len(parts), context_id[:20] if context_id else "none")
+
         for i, part in enumerate(parts):
             kind = part.get("kind") or part.get("type", "")
             text = part.get("text", "")
-            logger.info("Part[%d] kind=%s len=%d preview=%s", i, kind, len(text), text[:200])
- 
+            logger.info("Part[%d] kind=%s len=%d preview=%s",
+                        i, kind, len(text), text[:200])
+
             if kind == "data":
                 data = part.get("data", {})
                 if isinstance(data, dict) and "problem_statement" in data:
                     return data, context_id
- 
+
             if kind == "text" and text.strip():
                 try:
                     parsed = json.loads(text)
                     if isinstance(parsed, dict):
                         if "problem_statement" in parsed:
                             return parsed, context_id
-                        if any(k in parsed for k in ("stdout", "stderr", "cwd", "repo", "instance_id")):
+                        if any(k in parsed for k in
+                               ("stdout", "stderr", "cwd", "repo", "instance_id")):
                             return parsed, context_id
                 except (json.JSONDecodeError, ValueError):
                     pass
                 return {"problem_statement": text.strip()}, context_id
- 
+
     except Exception as e:
         logger.error("Extraction error: %s", e)
- 
+
     ps = _deep_find(body, "problem_statement")
     if ps:
         return {"problem_statement": ps}, context_id
- 
+
     logger.warning("Nothing found. Body keys: %s", list(body.keys()))
     return {}, context_id
 
