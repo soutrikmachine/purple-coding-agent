@@ -68,9 +68,6 @@ logger.info("GitHub Token  %s", "SET ✓" if GITHUB_TOKEN else "NOT SET")
 logger.info("MCTS          branches=%d  max_turns=%d  enabled=%s",
             MCTS_BRANCHES, MAX_TURNS, USE_MCTS)
 logger.info("=" * 60)
-logger.info("requirements=%s interface=%s",
-    str(message.get("requirements", ""))[:100],
-    str(message.get("interface", ""))[:100])
 
 
 # ==============================================================================
