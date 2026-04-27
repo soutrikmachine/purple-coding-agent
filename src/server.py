@@ -199,6 +199,15 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
     ref   = task.base_commit or "HEAD"
     files: dict[str, str] = {}
 
+    # 0. ALWAYS fetch the failing test files first — they define what must pass
+    for test in task.fail_to_pass[:4]:
+        test_file = test.split("::")[0]
+        if test_file and test_file not in files:
+            content = fetch_file_raw(task.repo, ref, test_file)
+            if content:
+                files[f"[FAILING TEST] {test_file}"] = content
+                logger.info("Fetched failing test: %s", test_file)
+
     # 1. Full paths from problem statement (most reliable)
     ps_full_paths = re.findall(
         r'(?:^|[\s`"\'(])('
@@ -225,8 +234,10 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
                 if content:
                     files[fp] = content
 
-    # 3. Tree API fallback — only when we have fewer than 2 files
-    if len(files) < 2:
+    # 3. Tree API fallback — only when we have fewer than 2 source files
+    # Count non-test files only
+    source_file_count = sum(1 for k in files if not k.startswith("[FAILING TEST]"))
+    if source_file_count < 2:
         tree = get_repo_tree(task.repo, ref)
         if tree:
             ps_words = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
@@ -235,7 +246,6 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
                 p_words = set(re.findall(r'\b\w{4,}\b', p.lower()))
                 return len(ps_words & p_words)
 
-            # Strict source-only filter
             src_files = [
                 p for p in tree
                 if re.search(r'\.(py|go|js|ts|tsx|jsx|rb|java|rs|c|cpp|h)$', p)
@@ -244,7 +254,7 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
             ranked = sorted(src_files, key=path_score, reverse=True)
 
             for fp in ranked[:6]:
-                if len(files) >= 6:
+                if len(files) >= 8:  # raised cap to accommodate test files
                     break
                 if fp not in files:
                     content = fetch_file_raw(task.repo, ref, fp)
@@ -693,6 +703,12 @@ class PurpleAgent:
             f"Commit: {task.base_commit or 'HEAD'}\n"
             f"{file_context}\n"
             "\n"
+            "STRATEGY:\n"
+            "1. Read the [FAILING TEST] file first — it defines EXACTLY what behavior must pass\n"
+            "2. Find the source code that implements that behavior in the other files\n"
+            "3. Make the MINIMAL change to make the test pass\n"
+            "4. Your diff must NOT touch the test file — only source files\n"
+            "\n"
             "CRITICAL RULES:\n"
             "1. Output ONLY a valid unified diff starting exactly with: diff --git\n"
             "2. Copy context lines CHARACTER-FOR-CHARACTER from the files above\n"
@@ -700,7 +716,8 @@ class PurpleAgent:
             "   One space difference will break git apply\n"
             "3. Change MAXIMUM 10 lines — minimal fix only\n"
             "4. Include exactly 3 unchanged context lines before and after changes\n"
-            "5. Do NOT include <think> tags, explanations, or markdown fences\n"
+            "5. Do NOT touch any file marked [FAILING TEST] — diff source files only\n"
+            "6. Do NOT include <think> tags, explanations, or markdown fences\n"
             "\n"
             "DIFF FORMAT:\n"
             "diff --git a/path/file.go b/path/file.go\n"
