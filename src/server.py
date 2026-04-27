@@ -68,6 +68,9 @@ logger.info("GitHub Token  %s", "SET ✓" if GITHUB_TOKEN else "NOT SET")
 logger.info("MCTS          branches=%d  max_turns=%d  enabled=%s",
             MCTS_BRANCHES, MAX_TURNS, USE_MCTS)
 logger.info("=" * 60)
+logger.info("requirements=%s interface=%s",
+    str(message.get("requirements", ""))[:100],
+    str(message.get("interface", ""))[:100])
 
 
 # ==============================================================================
@@ -186,12 +189,15 @@ def _derive_source_paths_from_test(test_path: str) -> list[str]:
 
 def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
     """
-    Fetch actual source file content from GitHub.
+    Fetch actual file content from GitHub.
 
     Strategy:
-    1. Try full paths explicitly mentioned in problem statement
+    0. If fail_to_pass provided: fetch those test files directly
+    1. Full paths explicitly mentioned in problem statement
     2. Derive source paths from test paths (test_foo.py → foo.py)
-    3. Fall back to tree API + keyword ranking (excluding test/cypress/etc.)
+    3. Tree API + keyword ranking for SOURCE files
+    4. If fail_to_pass is EMPTY (green agent withholds them):
+       use tree API to find the most relevant TEST files by keyword match
     """
     if not task.repo:
         return {}
@@ -199,16 +205,34 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
     ref   = task.base_commit or "HEAD"
     files: dict[str, str] = {}
 
-    # 0. ALWAYS fetch the failing test files first — they define what must pass
+    ps_words = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
+
+    def path_score(p: str) -> int:
+        p_words = set(re.findall(r'\b\w{4,}\b', p.lower()))
+        return len(ps_words & p_words)
+
+    # ── Step 0: fetch failing test files if provided ──────────────────────────
+    # Green agent often withholds fail_to_pass, so this may be empty
     for test in task.fail_to_pass[:4]:
         test_file = test.split("::")[0]
-        if test_file and test_file not in files:
+        if not test_file:
+            continue
+        # Only try if it looks like a file path (has / or known extension)
+        looks_like_path = "/" in test_file or bool(
+            re.search(r'\.(py|go|js|ts|tsx|jsx|java|rb|rs)$', test_file)
+        )
+        if not looks_like_path:
+            logger.warning("fail_to_pass '%s' is not a file path — skipping", test_file)
+            continue
+        if test_file not in files:
             content = fetch_file_raw(task.repo, ref, test_file)
             if content:
                 files[f"[FAILING TEST] {test_file}"] = content
                 logger.info("Fetched failing test: %s", test_file)
+            else:
+                logger.warning("Test file 404: %s", test_file)
 
-    # 1. Full paths from problem statement (most reliable)
+    # ── Step 1: full paths from problem statement ─────────────────────────────
     ps_full_paths = re.findall(
         r'(?:^|[\s`"\'(])('
         r'[\w][\w/.-]+\.(?:py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h|php|cs|swift|kt)'
@@ -222,7 +246,7 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
             if content:
                 files[fp] = content
 
-    # 2. Derive source file paths from test paths in fail_to_pass
+    # ── Step 2: derive source paths from test paths ───────────────────────────
     for test in task.fail_to_pass[:4]:
         test_file = test.split("::")[0]
         derived   = _derive_source_paths_from_test(test_file)
@@ -234,32 +258,42 @@ def fetch_relevant_files(task: "SWETask") -> dict[str, str]:
                 if content:
                     files[fp] = content
 
-    # 3. Tree API fallback — only when we have fewer than 2 source files
-    # Count non-test files only
-    source_file_count = sum(1 for k in files if not k.startswith("[FAILING TEST]"))
-    if source_file_count < 2:
+    # ── Step 3: tree API for source files ────────────────────────────────────
+    source_count = sum(1 for k in files if not k.startswith("[FAILING TEST]"))
+    if source_count < 2:
         tree = get_repo_tree(task.repo, ref)
         if tree:
-            ps_words = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
-
-            def path_score(p: str) -> int:
-                p_words = set(re.findall(r'\b\w{4,}\b', p.lower()))
-                return len(ps_words & p_words)
-
             src_files = [
                 p for p in tree
                 if re.search(r'\.(py|go|js|ts|tsx|jsx|rb|java|rs|c|cpp|h)$', p)
                 and _is_source_file(p)
             ]
-            ranked = sorted(src_files, key=path_score, reverse=True)
-
-            for fp in ranked[:6]:
-                if len(files) >= 8:  # raised cap to accommodate test files
+            ranked_src = sorted(src_files, key=path_score, reverse=True)
+            for fp in ranked_src[:6]:
+                if len(files) >= 8:
                     break
                 if fp not in files:
                     content = fetch_file_raw(task.repo, ref, fp)
                     if content:
                         files[fp] = content
+
+            # ── Step 4: when fail_to_pass is empty, also find relevant TEST files
+            # The green agent withholds test names, so we find them via keyword search
+            if not task.fail_to_pass:
+                test_files = [
+                    p for p in tree
+                    if re.search(r'\.(py|go|js|ts|tsx|jsx|rb|java|rs)$', p)
+                    and not _is_source_file(p)  # IS a test file
+                ]
+                ranked_tests = sorted(test_files, key=path_score, reverse=True)
+                for fp in ranked_tests[:2]:
+                    if len(files) >= 10:
+                        break
+                    if fp not in files:
+                        content = fetch_file_raw(task.repo, ref, fp)
+                        if content:
+                            files[f"[RELEVANT TEST] {fp}"] = content
+                            logger.info("Fetched relevant test by keyword: %s", fp)
 
     logger.info("Fetched %d files from GitHub for %s", len(files), task.repo)
     return files
@@ -463,6 +497,8 @@ class SWETask:
     repo: str = ""
     instance_id: str = ""
     base_commit: str = ""
+    requirements: str = ""
+    interface: str = ""
 
 
 # ==============================================================================
@@ -554,6 +590,8 @@ class PurpleAgent:
             repo=message.get("repo", ""),
             instance_id=message.get("instance_id", ""),
             base_commit=message.get("base_commit", ""),
+            requirements=message.get("requirements", ""),
+            interface=message.get("interface", ""),
         )
         root    = MCTSNode(state={"cwd": task.cwd})
         session = {
@@ -567,6 +605,10 @@ class PurpleAgent:
             "_fetched_files":  None,
         }
         self._sessions[session_id] = session
+        logger.info("[%s] requirements_len=%d interface_len=%d",
+            session_id[:20],
+            len(task.requirements),
+            len(task.interface)) 
         logger.info("[%s] New session repo=%s commit=%s",
                     session_id[:20], task.repo,
                     task.base_commit[:12] if task.base_commit else "HEAD")
@@ -704,19 +746,20 @@ class PurpleAgent:
             f"{file_context}\n"
             "\n"
             "STRATEGY:\n"
-            "1. Read the [FAILING TEST] file first — it defines EXACTLY what behavior must pass\n"
-            "2. Find the source code that implements that behavior in the other files\n"
-            "3. Make the MINIMAL change to make the test pass\n"
-            "4. Your diff must NOT touch the test file — only source files\n"
+            "1. Read [FAILING TEST] or [RELEVANT TEST] files first — they show what behavior is tested\n"
+            "2. Understand exactly what the test expects the source code to do\n"
+            "3. Find the source code responsible for that behavior in the other files\n"
+            "4. Make the MINIMAL change to the SOURCE code to satisfy the test\n"
+            "5. Do NOT modify any test file — only modify source files\n"
             "\n"
             "CRITICAL RULES:\n"
             "1. Output ONLY a valid unified diff starting exactly with: diff --git\n"
             "2. Copy context lines CHARACTER-FOR-CHARACTER from the files above\n"
             "   DO NOT paraphrase or reformat context lines even slightly\n"
             "   One space difference will break git apply\n"
-            "3. Change MAXIMUM 10 lines — minimal fix only\n"
+            "3. The patch may span MULTIPLE FILES and 50-150 lines — implement everything required\n"
             "4. Include exactly 3 unchanged context lines before and after changes\n"
-            "5. Do NOT touch any file marked [FAILING TEST] — diff source files only\n"
+            "5. Do NOT touch [FAILING TEST] or [RELEVANT TEST] files — diff source files only\n"
             "6. Do NOT include <think> tags, explanations, or markdown fences\n"
             "\n"
             "DIFF FORMAT:\n"
@@ -735,9 +778,13 @@ class PurpleAgent:
         )
 
         user = (
-            f"Fix this GitHub issue:\n\n{task.problem_statement[:2500]}"
-            f"{test_hint}{hints_hint}"
+            f"## Problem Statement\n\n{task.problem_statement[:2000]}\n\n"
         )
+        if task.requirements:
+            user += f"## Requirements\n(These are grounded on the tests — implement ALL of these)\n\n{task.requirements}\n\n"
+        if task.interface:
+            user += f"## Interface\n(Use EXACTLY these function/class names and signatures)\n\n{task.interface}\n\n"
+        user += test_hint + hints_hint
 
         return [
             {"role": "system", "content": system},
