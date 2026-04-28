@@ -663,11 +663,13 @@ class LLMClient:
                 if resp.status_code != 200:
                     logger.error("LLM %d: %s", resp.status_code, resp.text[:300])
                     return ""
-                content = resp.json()["choices"][0]["message"]["content"]
-                if content is None:
-                    logger.error("LLM returned content=null — check model config")
+                message = resp.json()["choices"][0]["message"]
+                content = message.get("content") or message.get("reasoning_content", "")
+                if not content:
+                    logger.error("LLM returned content=null and reasoning_content=null")
                     return ""
-                logger.info("LLM returned %d chars", len(content))
+                logger.info("LLM returned %d chars%s", len(content),
+                            " (from reasoning_content)" if not message.get("content") else "")
                 return content
             except requests.RequestException as e:
                 logger.warning("LLM attempt %d/3: %s", attempt, e)
@@ -727,6 +729,8 @@ def _build_repair_messages(
     located_paths: list[str],
     fetched_files: dict[str, str],
     hypotheses: list[dict] | None = None,   # Stage 1.5 output
+    prior_patch: str | None = None,
+    iteration: int = 0, 
 ) -> list[dict]:
     """
     Build the final patch generation prompt.
@@ -811,7 +815,27 @@ def _build_repair_messages(
             "- No <think> tags, no markdown fences, no explanation\n"
         )
 
+    # ── Prior patch block (iteration > 0 only) ─────────────────────────
+    prior_patch_block = ""
+    if prior_patch and iteration > 0:
+        snippet = prior_patch[:2000] + (" …[truncated]" if len(prior_patch) > 2000 else "")
+        prior_patch_block = (
+            "\n\n## Previous Best Patch (improve on this)\n\n"
+            f"```diff\n{snippet}\n```\n\n"
+            "The above patch was the best attempt so far but may still be "
+            "incomplete or logically wrong. Study it carefully:\n"
+            "- What did it get right?\n"
+            "- What is missing or incorrect?\n"
+            "- How can you fix its weaknesses while preserving its strengths?\n"
+        )
+
     # ── User message — hypotheses placed prominently before files ───────────
+    closing = (
+        "\n\nNow output the IMPROVED unified diff patch:"
+        if prior_patch_block else
+        "\n\nNow output the final unified diff patch:"
+    )
+    
     user = (
         f"Repository: {task.repo}  commit: {task.base_commit or 'HEAD'}\n\n"
         f"## Bug Report\n\n{task.problem_statement[:4000]}"   # was :2000
@@ -1036,70 +1060,67 @@ class PurpleAgent:
 
     # ── Stage 2: MCTS Repair ──────────────────────────────────────────────────
 
-    async def _mcts_repair(self, session: dict) -> str:
-        """
-        Generate MCTS_BRANCHES patch candidates in parallel.
-        Temperature schedule spans 0.15 → 0.80 for diversity.
-        All branches receive the hypothesis block as additional context.
-        PRM selects the highest-scoring valid patch.
-        """
+    MCTS_ITERATIONS = 3   # rounds of refinement (total calls = branches × iterations)
+                       # = 3 × 2 = 6 LLM calls, well within 300s with DeepSeek
+
+    async def _mcts_repair(self, session):
         task = session["task"]
-        msgs = _build_repair_messages(
-            task,
-            session["history"],
-            session["located_paths"] or [],
-            session["fetched_files"],
-            session.get("hypotheses") or [],   # ← Stage 1.5 output injected here
-        )
-
-        temps = [
-            0.15 + (0.65 / max(MCTS_BRANCHES - 1, 1)) * i
-            for i in range(MCTS_BRANCHES)
-        ]
-
-        # Fire all branches simultaneously
-        raws = await asyncio.gather(*[
-            asyncio.to_thread(self.llm.complete, msgs, t, 2048)
-            for t in temps
-        ])
-
-        candidates: list[tuple[str, float]] = []
-        for i, raw in enumerate(raws):
-            patch = _extract_patch(raw)
-            score = self.prm.score(patch, task)
-            candidates.append((patch, score))
-            logger.info("[%s] Branch %d/%d T=%.2f score=%.3f len=%d",
-                        session["id"][:20], i+1, MCTS_BRANCHES,
-                        temps[i], score, len(patch))
-
-        if not candidates or all(s == 0 for _, s in candidates):
-            logger.warning("[%s] All branches scored 0 — returning best effort",
-                           session["id"][:20])
-            return max((p for p, _ in candidates if p), key=len, default="")
-
-        # ── PLT self-consistency check (Stage 2.5) ────────────────────────
-        # One LLM call ranks all branches by programming logic validity
-        # against the hypotheses. Blends 40% heuristic + 60% PLT score.
-        # No per-task timeout on AgentBeats — only limit is 300 min / shard.
-        # Each LLM call already has timeout=90 in LLMClient.complete().
         hypotheses = session.get("hypotheses") or []
-        if hypotheses:
-            logger.info("[%s] Running PLT self-consistency check …",
-                        session["id"][:20])
-            candidates = await asyncio.to_thread(
-                llm_plt_consistency_check,
-                candidates,
-                hypotheses,
+    
+        best_patch = ""
+        best_score = 0.0
+    
+        for iteration in range(MCTS_ITERATIONS):
+            # Build prompt — on iteration>0, include the best patch so far
+            # so the model can see what to improve
+            msgs = _build_repair_messages(
                 task,
-                self.llm,
+                session["history"],
+                session["located_paths"] or [],
+                session["fetched_files"],
+                hypotheses,
+                prior_patch=best_patch if iteration > 0 else None,  # ← KEY
+                iteration=iteration,
             )
-
-        best_patch = session["mcts"].select(candidates)
-        best_score = next(s for p, s in candidates if p == best_patch)
-        session["mcts"].backpropagate(best_score)
-
-        logger.info("[%s] MCTS selected score=%.3f len=%d",
-                    session["id"][:20], best_score, len(best_patch))
+        
+            temps = [0.15 + (0.65 / max(MCTS_BRANCHES - 1, 1)) * i
+                     for i in range(MCTS_BRANCHES)]
+        
+            raws = await asyncio.gather(*[
+                asyncio.to_thread(self.llm.complete, msgs, t, 2048)
+                for t in temps
+            ])
+        
+            candidates = []
+            for i, raw in enumerate(raws):
+                patch = _extract_patch(raw)
+                score = self.prm.score(patch, task)
+                candidates.append((patch, score))
+                logger.info("[%s] Iter %d Branch %d/%d T=%.2f score=%.3f len=%d",
+                            session["id"][:20], iteration+1, i+1,
+                            MCTS_BRANCHES, temps[i], score, len(patch))
+        
+            # PLT check
+            if hypotheses:
+                candidates = await asyncio.to_thread(
+                    llm_plt_consistency_check, candidates, hypotheses, task, self.llm
+                )
+        
+            # MCTS select — NOW UCT is meaningful because root accumulates visits
+            round_best = session["mcts"].select(candidates)
+            round_score = next(s for p, s in candidates if p == round_best)
+            session["mcts"].backpropagate(round_score)
+        
+            if round_score > best_score:
+                best_score = round_score
+                best_patch = round_best
+                logger.info("[%s] Iter %d improved: score=%.3f",
+                            session["id"][:20], iteration+1, best_score)
+            else:
+                logger.info("[%s] Iter %d no improvement — stopping early",
+                            session["id"][:20], iteration+1)
+                break   # early stopping if score didn't improve
+    
         return best_patch
 
 
