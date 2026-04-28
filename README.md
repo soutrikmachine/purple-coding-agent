@@ -1,172 +1,112 @@
-# 🟣 Purple Coding Agent — AgentBeats Phase 2
+# 🟣 Purple Coding Agent
 
-[![AgentBeats](https://img.shields.io/badge/AgentBeats-Phase%202-purple)](https://agentbeats.dev)
-[![Competition](https://img.shields.io/badge/AgentX-SWE--bench%20Pro-blue)](https://rdi.berkeley.edu/agentx-agentbeats)
+[![AgentBeats SWE-Bench Pro](https://img.shields.io/badge/AgentBeats-SWE--Bench%20Pro-purple)](https://agentbeats.dev/agentbeater/swe-bench)
 [![Docker](https://img.shields.io/badge/Docker-rimodock%2Fpurple--coding--agent-blue)](https://hub.docker.com/r/rimodock/purple-coding-agent)
+[![Python](https://img.shields.io/badge/Python-3.11+-green)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-A **multi-turn software engineering agent** built for the [AgentX–AgentBeats](https://rdi.berkeley.edu/agentx-agentbeats) Phase 2 competition (Coding Agent track), evaluated against **AgentSWE** on **SWE-bench Pro**.
-
----
-
-## Architecture Overview
-
-The agent uses a **3-stage pipeline** that combines static analysis, interactive bash exploration, and parallel patch generation:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     PURPLE CODING AGENT (v3)                    │
-│                                                                 │
-│  ┌─────────────┐                                                │
-│  │  A2A Server │  FastAPI — handles JSON-RPC multi-turn msgs    │
-│  │  (FastAPI)  │                                                │
-│  └──────┬──────┘                                                │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   STAGE 1 — LOCALIZATION                │   │
-│  │  GitHub Tree API → filter 300 source files →            │   │
-│  │  LLM reasons: "which files contain the bug?" →          │   │
-│  │  Returns JSON array of file paths                       │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              STAGE 2 — BASH EXPLORATION                 │   │
-│  │  Turns 1 to MAX_TURNS-1:                                │   │
-│  │  • LLM decides next bash command (grep, cat, pytest)    │   │
-│  │  • Green agent executes in real repo Docker container   │   │
-│  │  • stdout/stderr returned in next A2A turn              │   │
-│  │  • Full conversation history accumulated                │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│         │                                                       │
-│         ▼                                                       │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                STAGE 3 — MCTS REPAIR                    │   │
-│  │  Final turn:                                            │   │
-│  │  • 3 parallel patch candidates (asyncio.gather)         │   │
-│  │  • Temperature diversity: 0.15 → 0.48 → 0.80           │   │
-│  │  • PRM scores each: format + relevance + completeness   │   │
-│  │  • UCT-based MCTS selects highest-scoring valid patch   │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+A software engineering agent built for the **AgentX–AgentBeats SWE-Bench Pro** competition. Evaluated against 100 instances of real-world GitHub issue resolution across 41 repositories.
 
 ---
 
-## Why Multi-Turn?
+## Architecture — 5-Stage Pipeline
 
-SWE-bench Pro deliberately withholds test names, requirements, and interface specs. The green agent only sends:
+```
+Green Agent (SWE-Bench Pro)
+         │  problem_statement + repo + commit
+         ▼
+┌─────────────────────────────────────────────────────────┐
+│  Stage 1 — LLM LOCALIZATION                             │
+│  GitHub Tree API → LLM → top-5 file paths → fetch      │
+│  (parallel asyncio.gather for file fetches)             │
+├─────────────────────────────────────────────────────────┤
+│  Stage 1.5 — SYNTHETIC TEST FAILURE HYPOTHESES  ★novel  │
+│  Source files + bug report → LLM infers:                │
+│    • Which assertion is likely failing?                  │
+│    • Expected value vs. actual (buggy) value            │
+│    • Root cause: exact function / condition at fault     │
+│    • fix_hint: concrete code change required            │
+│  Returns 2–3 ranked hypotheses (confidence-scored)       │
+│  Acts as a synthetic oracle when tests are withheld     │
+├─────────────────────────────────────────────────────────┤
+│  Stage 2 — MCTS REPAIR (iterative, MCTS_ITERATIONS=3)  │
+│  Per iteration:                                          │
+│    3 parallel branches (T = 0.15 / 0.47 / 0.80)        │
+│    Each branch sees: bug report + hypotheses +           │
+│    source files + prior best patch (iteration > 0)      │
+│  Heuristic PRM: format × relevance × completeness       │
+├─────────────────────────────────────────────────────────┤
+│  Stage 2.5 — PLT SELF-CONSISTENCY CHECK                 │
+│  One LLM call evaluates all 3 branches against          │
+│  the hypotheses:                                        │
+│    • Does patch logic address root_cause?                │
+│    • Is the programming technique sound?                 │
+│  final_score = 0.40 × heuristic + 0.60 × PLT score     │
+├─────────────────────────────────────────────────────────┤
+│  UCT Selection + Backpropagate                          │
+│  (non-void from iteration 2 as parent visits grow)      │
+│  Early stopping if score doesn't improve               │
+└─────────────────────────────────────────────────────────┘
+         │  unified diff patch
+         ▼
+Green Agent applies patch → runs tests → pass/fail
+```
+
+---
+
+## Key Novelty
+
+### Hypothesis-Conditioned Repair Under Test Occlusion
+
+SWE-Bench Pro deliberately withholds test files (`fail_to_pass`, `test_patch`, `requirements`) to prevent benchmark gaming. Every published approach accepts this blindness:
+
+- **With execution** (SWE-agent, OpenHands): runs failing tests and reads tracebacks
+- **Without execution** (Agentless, ACR): patches based on bug report alone, accepts the blindness
+
+This agent does neither — **it refuses to accept the blindness**. Stage 1.5 uses the source files themselves as an oracle substrate: the model knows what the code *does* (readable) and what the bug report says it *should* do, and formalises that gap into structured predictions:
 
 ```json
 {
-  "problem_statement": "...",
-  "repo": "ansible/ansible",
-  "base_commit": "abc123..."
+  "failure_mode": "TestKernelPackageSelectionForDebugVariant: scanner returns wrong version",
+  "expected_value": "kernel-debug-5.14.0-284.el9 version string",
+  "actual_value": "empty string — regex fails on el9.x format",
+  "root_cause": "versionRegex in scanner/redhatbase.go ~line 142 doesn't handle el9.x",
+  "fix_hint": "Change regex from `el(\\d)` to `el(\\d+(?:\\.\\d+)?)`",
+  "confidence": 0.95
 }
 ```
 
-Without seeing what the failing test actually checks, single-turn blind patching generates valid diffs that fix the wrong code. Multi-turn bash exploration solves this:
-
-```
-Turn 1 → bash: "cat -n lib/config/cluster.go | head -100"
-Turn 2 ← real file content with real line numbers
-Turn 3 → bash: "go test ./lib/... -run TestClusterConfig --tb=short"
-Turn 4 ← ACTUAL test failure: "expected true, got false at line 67"
-Turn 5 → bash: "grep -n 'isValid' lib/config/cluster.go"
-Turn 6 → patch: informed diff at exact line with exact context
-```
-
-The green agent executes our bash commands in the repo's Docker container and returns stdout/stderr — we get interactive shell access without managing Docker ourselves.
+These hypotheses then condition both patch generation (MCTS branches know *what to fix*) and patch selection (PLT checks whether each branch's logic *actually satisfies* the hypothesis).
 
 ---
 
-## Key Design Decisions
+## MCTS & UCT
 
-| Decision | Rationale |
-|---|---|
-| LLM localization over keyword search | Semantics beat syntax — LLM understands "caching bug in cluster config → look in `lib/services/`" |
-| Bash exploration before patching | Real stack traces beat static GitHub snapshots |
-| `asyncio.gather` for MCTS branches | All 3 repair candidates fire simultaneously — same wall-clock time as 1 |
-| `contextId` as session key | Persists across ALL turns; `instance_id` only appears in turn 1 |
-| No `"reasoning"` param in Gemma 4 payload | Causes `content: null` crash; Gemma 4 reasons naturally via `<think>` blocks |
-| Strip `<think>` before patch extraction | Prevents reasoning tokens from corrupting the unified diff |
+With `MCTS_ITERATIONS = 3` and `MCTS_BRANCHES = 3`, the tree builds real visit counts across iterations:
+
+```
+UCT(j) = V̄ⱼ + √2 × √(ln N / nⱼ)
+```
+
+- Iteration 1: parent visits = 0, exploration term = 0 → greedy max
+- Iteration 2: parent visits > 0, UCT becomes meaningful
+- Iteration 3: full exploitation/exploration balance across 9 evaluated candidates
+
+Between iterations, the prompt includes the **previous best patch** so the model critiques and improves rather than generating independently. This is critique-and-refine, not independent sampling.
 
 ---
 
-## Repository Structure
+## LLM Calls Per Task
 
-```
-purple-coding-agent/
-├── src/
-│   └── server.py            # Complete single-file implementation (v3)
-│                            # Contains: A2A server, localization, bash exploration,
-│                            # MCTS engine, PRM, LLM client, session management
-├── Dockerfile               # Single-stage, linux/amd64
-├── requirements.txt         # fastapi, uvicorn, requests, httpx
-├── amber-manifest.json5     # AgentBeats deployment config
-└── README.md
-```
-
-Everything is in `src/server.py` — no separate modules needed.
-
----
-
-## Agent Protocol (A2A)
-
-Implements the [A2A Protocol](https://a2a-protocol.org/) spec:
-
-### Endpoints
-
-```
-GET  /.well-known/agent-card.json   # Agent capability declaration
-GET  /.well-known/agent.json        # Compatibility alias
-GET  /health                        # Health check
-POST /                              # Handle A2A JSON-RPC message (all turns)
-```
-
-### Action Types
-
-| Action | When | Content |
+| Call | Description | Tokens (max) |
 |---|---|---|
-| `bash` | Exploration turns 1 to N-1 | Shell command executed in repo container |
-| `patch` | Final turn | Unified git diff starting with `diff --git` |
+| Localization | File tree → top-5 paths | 256 |
+| Hypothesis synthesis | Source files → failure hypotheses | 1200 |
+| MCTS branch 1,2,3 × 3 iterations | Patch generation | 2048 each |
+| PLT check × 3 iterations | Branch ranking | 512 each |
+| **Total** | | **~14 calls** |
 
-### Exploration Prompt Format
-
-The LLM is instructed to respond in XML during exploration:
-
-```xml
-<thought>
-I can see the cluster config caching is done in lib/config/cluster.go.
-The isValidationPending check on line 67 uses stale cache — need to
-force refresh on session renewal.
-</thought>
-<action>bash</action>
-<content>
-grep -n "isValidationPending\|cache\|refresh" lib/config/cluster.go | head -30
-</content>
-```
-
----
-
-## Session Lifecycle
-
-```
-POST / (turn 1)  → extract contextId → create session
-                 → Stage 1: fetch tree → LLM localize → fetch files
-                 → return bash action (explore located files)
-
-POST / (turn 2)  → same contextId → record observation (stdout/stderr)
-                 → LLM decides next bash command
-                 → return bash action
-
-POST / (turns 3-5) → accumulate exploration history
-
-POST / (turn 6)  → MAX_TURNS reached
-                 → Stage 3: MCTS repair with full context
-                 → return patch action
-```
+At ~8–10s/call with DeepSeek-v4-flash, total task time ≈ 90–120s — well within the 300s gateway limit.
 
 ---
 
@@ -175,41 +115,49 @@ POST / (turn 6)  → MAX_TURNS reached
 ### Prerequisites
 
 - Docker
-- OpenRouter API key (for Gemma 4 31B)
-- GitHub personal access token (for repo tree/file fetching)
+- OpenRouter API key (`OPENROUTER_KEY`)
+- GitHub token, read-only public repos (`GITHUB_TOKEN`)
 
 ### Run Locally
 
 ```bash
-# Clone
-git clone https://github.com/soutrikmachine/purple-coding-agent
-cd purple-coding-agent
+# Pull and run
+docker pull rimodock/purple-coding-agent:latest
 
-# Build
-docker buildx build --platform linux/amd64 -t purple-coding-agent:local .
-
-# Run
 docker run -p 9010:9010 \
   -e OPENROUTER_API_KEY=your_key \
   -e GITHUB_TOKEN=your_token \
-  purple-coding-agent:local
+  -e MODEL_NAME=deepseek/deepseek-v4-flash \
+  -e MCTS_BRANCHES=3 \
+  -e MCTS_ITERATIONS=3 \
+  rimodock/purple-coding-agent:latest
 
-# Verify
+# Health check
 curl http://localhost:9010/health
+
+# Agent card
 curl http://localhost:9010/.well-known/agent-card.json
 ```
 
-### Deploy to AgentBeats
+### Send a Test Task
 
 ```bash
-# Build and push (M1/M2 Mac cross-compile)
-docker buildx build --no-cache --platform linux/amd64 \
-  -t rimodock/purple-coding-agent:latest --push .
+curl -X POST http://localhost:9010/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "test-1",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "parts": [{
+          "kind": "text",
+          "text": "{\"problem_statement\": \"Fix the None handling bug\", \"repo\": \"owner/repo\", \"base_commit\": \"abc123\"}"
+        }]
+      }
+    }
+  }'
 ```
-
-Then Quick Submit on [agentbeats.dev](https://agentbeats.dev) with secrets:
-- `OPENROUTER_KEY` → your OpenRouter API key
-- `GITHUB_TOKEN` → your GitHub personal access token
 
 ---
 
@@ -217,89 +165,89 @@ Then Quick Submit on [agentbeats.dev](https://agentbeats.dev) with secrets:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible LLM endpoint |
-| `MODEL_NAME` | `deepseek/deepseek-v4-flash` | Model ID on OpenRouter |
-| `OPENROUTER_API_KEY` | — | OpenRouter API key (set as secret) |
-| `GITHUB_TOKEN` | — | GitHub PAT for tree/file API (set as secret) |
-| `PORT` | `9010` | Agent server port |
-| `MAX_TURNS` | `6` | Bash exploration turns before forcing patch |
-| `MCTS_BRANCHES` | `3` | Parallel patch candidates in Stage 3 |
-| `USE_MCTS` | `true` | Enable MCTS selection (false = greedy) |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (required) |
+| `GITHUB_TOKEN` | — | GitHub token, public read-only (required) |
+| `MODEL_NAME` | `deepseek/deepseek-v4-flash` | OpenRouter model ID |
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | LLM API base URL |
+| `MCTS_BRANCHES` | `3` | Parallel patch candidates per iteration |
+| `MCTS_ITERATIONS` | `3` | Refinement rounds (UCT meaningful from round 2) |
+| `USE_MCTS` | `true` | Enable/disable MCTS |
+| `PORT` | `9010` | Server port |
 
 ---
 
-## MCTS Patch Selection
+## Project Structure
 
-On the final turn, 3 patch candidates are generated simultaneously via `asyncio.gather` with temperature diversity:
+```
+purple-coding-agent/
+├── src/
+│   └── server.py          # All pipeline logic (single-file architecture)
+├── docker/                # Docker build configs
+├── scripts/               # Utility scripts
+├── tests/                 # Test suite
+├── Dockerfile
+├── docker-compose.yml
+├── amber-manifest.json5   # AgentBeats manifest
+├── requirements.txt
+└── README.md
+```
 
-$$T_i = 0.15 + \frac{0.65}{N-1} \cdot i \quad \text{for } i \in \{0, 1, 2\}$$
-
-Giving temperatures **[0.15, 0.48, 0.80]** — conservative, balanced, creative.
-
-Each candidate is scored by the **Programmable Reward Model (PRM)**:
-
-| Layer | Weight | Signal |
-|---|---|---|
-| Format | 35% | Valid `diff --git` structure, `@@` hunks, `+`/`-` lines |
-| Relevance | 35% | Overlap between patch tokens and problem statement |
-| Completeness | 30% | Non-empty, non-truncated diff |
-
-UCT-based MCTS selects the highest-scoring candidate and backpropagates the reward.
-
----
-
-## Benchmark Context
-
-| Benchmark | Our Agent | SOTA |
-|---|---|---|
-| SWE-bench Pro | 0.0% (work in progress) | 58.6% (Kimi-K2.6) |
-| SWE-bench Verified | not yet evaluated | ~70%+ |
-
-SWE-bench Pro is the hardest coding benchmark — average gold patch is **107 lines across 4.1 files**, and every task deliberately excludes trivially solvable bugs. Even GPT-5 scores ~23%.
-
-Current status: patches apply cleanly (`pass_to_pass_ok: True`) but fix the wrong code (`fail_to_pass_ok: False`). Multi-turn exploration is the structural fix for this.
+`server.py` contains the full pipeline as a single cohesive file:
+- `LLMClient` — OpenRouter client with `reasoning_content` fallback for thinking models
+- `llm_localize()` — Stage 1 file localization
+- `llm_synthesize_hypotheses()` — Stage 1.5 synthetic oracle construction
+- `llm_plt_consistency_check()` — Stage 2.5 PLT self-consistency scoring
+- `ProgrammablePRM` — Heuristic scorer (format / relevance / completeness)
+- `MCTSEngine` — UCT tree with backpropagation
+- `PurpleAgent` — Main orchestrator
+- FastAPI A2A server
 
 ---
 
-## Development History
+## Build & Push
 
-| Version | Architecture | Pass Rate |
-|---|---|---|
-| v1 | Single-turn blind patching (keyword file search) | 1% (lucky) |
-| v2 | Two-stage: LLM localization + MCTS repair | 0% (wrong code) |
-| v3 | Three-stage: localization + bash exploration + MCTS | TBD |
+```bash
+# Build
+docker build -t rimodock/purple-coding-agent:latest .
 
-Key lessons learned:
-- `pass_to_pass_ok: True` on all tasks — patch format and git apply are correct
-- `fail_to_pass_ok: False` on all tasks — model patches adjacent code, not the bug
-- Green agent withholds `fail_to_pass`, `requirements`, `interface`, `test_patch`
-- Keyword file search fetches semantically wrong files
-- LLM localization (semantic reasoning over repo tree) fetches the right files
-- Without interactive execution, even correct files don't tell you what line to change
+# Push
+docker push rimodock/purple-coding-agent:latest
+```
+
+GitHub Actions automatically builds and pushes on every push to `main`.
+
+---
+
+## AgentBeats Submission
+
+1. Go to [agentbeats.dev](https://agentbeats.dev) → Quick Submit
+2. Docker image: `rimodock/purple-coding-agent:latest`
+3. Required secrets:
+   - `OPENROUTER_KEY` → your OpenRouter API key
+   - `GITHUB_TOKEN` → GitHub PAT (public repos, read-only)
 
 ---
 
 ## Roadmap
 
-- [x] A2A protocol (JSON-RPC, contextId session, correct response format)
-- [x] GitHub file fetching (raw.githubusercontent.com + Tree API)
-- [x] LLM-based semantic localization
-- [x] Async MCTS with PRM scoring
-- [x] Multi-turn bash exploration loop
-- [ ] Validate multi-turn pass rate improvement
-- [ ] Switch to DeepSeek V4 Pro for serious leaderboard submission
-- [ ] Implement GRPO fine-tuning on SWE-bench Lite trajectories
-- [ ] Evaluate on SWE-bench Verified, SWE-bench Lite, Terminal Bench
+- [x] Stage 1: LLM localization via GitHub Tree API
+- [x] Stage 1.5: Synthetic test failure hypothesis generation
+- [x] Stage 2: MCTS repair with parallel branch generation
+- [x] Stage 2.5: PLT self-consistency check
+- [x] Iterative refinement with prior-patch conditioning (UCT-meaningful)
+- [x] DeepSeek-v4-flash integration with reasoning_content fallback
+- [ ] Phase 2: Multi-turn bash exploration with local Docker execution
+- [ ] Graph RAG: Call-graph traversal for hypothesis grounding
+- [ ] GRPO fine-tuning on (hypothesis, patch, pass/fail) triples
 
 ---
 
 ## Competition
 
-- **Competition:** [AgentX–AgentBeats Phase 2](https://rdi.berkeley.edu/agentx-agentbeats)
-- **Track:** Coding Agent — Sprint 3 (Apr 13 – May 3, 2026)
-- **Evaluation:** SWE-bench Pro (100 tasks, 20 shards)
-- **Metric:** Pass rate — `fail_to_pass_ok` across all instances
-- **Leaderboard:** [agentbeats.dev/agentbeater/swe-bench](https://agentbeats.dev/agentbeater/swe-bench)
+- **Platform:** [AgentBeats](https://agentbeats.dev/agentbeater/swe-bench)
+- **Benchmark:** SWE-Bench Pro — 100 instances, 41 repositories
+- **Protocol:** A2A (Google Agent-to-Agent)
+- **Green Agent:** Single-turn — sends problem statement, awaits patch
 
 ---
 
