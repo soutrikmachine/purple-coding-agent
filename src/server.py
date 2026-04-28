@@ -61,7 +61,7 @@ logger = logging.getLogger("purple_agent")
 # ── Config ────────────────────────────────────────────────────────────────────
 
 LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-MODEL_NAME    = os.getenv("MODEL_NAME", "google/gemma-4-31b-it")
+MODEL_NAME    = os.getenv("MODEL_NAME", "deepseek/deepseek-v4-flash")
 API_KEY       = (
     os.getenv("OPENROUTER_API_KEY", "")
     or os.getenv("LLM_API_KEY", "")

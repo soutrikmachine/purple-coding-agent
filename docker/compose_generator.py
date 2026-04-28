@@ -20,7 +20,7 @@ services:
       - "9010:9010"
     environment:
       - LLM_BASE_URL=http://vllm:8000
-      - MODEL_NAME=google/gemma-4-31b-it
+      - MODEL_NAME=deepseek/deepseek-v4-flash
       - MAX_TURNS=15
       - MCTS_BRANCHES=3
       - TEMPERATURE=0.6
@@ -44,7 +44,7 @@ services:
     environment:
       - OPENROUTER_HUB_TOKEN=${OPENROUTER_API_KEY}
     command: >
-      --model google/gemma-4-31b-it
+      --model deepseek/deepseek-v4-flash
       --dtype bfloat16
       --max-model-len 8192
       --gpu-memory-utilization 0.85

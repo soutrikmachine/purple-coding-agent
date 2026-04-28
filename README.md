@@ -218,7 +218,7 @@ Then Quick Submit on [agentbeats.dev](https://agentbeats.dev) with secrets:
 | Variable | Default | Description |
 |---|---|---|
 | `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible LLM endpoint |
-| `MODEL_NAME` | `google/gemma-4-31b-it` | Model ID on OpenRouter |
+| `MODEL_NAME` | `deepseek/deepseek-v4-flash` | Model ID on OpenRouter |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key (set as secret) |
 | `GITHUB_TOKEN` | — | GitHub PAT for tree/file API (set as secret) |
 | `PORT` | `9010` | Agent server port |
