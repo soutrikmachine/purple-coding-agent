@@ -16,6 +16,7 @@
       "MODEL_NAME": "google/gemma-4-31b-it",
       "USE_MCTS": "true",
       "MCTS_BRANCHES": "3",
+      "MAX_TURNS": "6",
       "OPENROUTER_API_KEY": "${config.openrouter_key}",
       "GITHUB_TOKEN": "${config.github_token}"
     }

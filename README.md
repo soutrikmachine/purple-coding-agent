@@ -1,86 +1,171 @@
-# 🟣 Phoenix Agent — AgentBeats Phase 2
+# 🟣 Purple Coding Agent — AgentBeats Phase 2
 
-[![CI](https://github.com/YOUR_USERNAME/purple-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/purple-agent/actions)
 [![AgentBeats](https://img.shields.io/badge/AgentBeats-Phase%202-purple)](https://agentbeats.dev)
+[![Competition](https://img.shields.io/badge/AgentX-SWE--bench%20Pro-blue)](https://rdi.berkeley.edu/agentx-agentbeats)
+[![Docker](https://img.shields.io/badge/Docker-rimodock%2Fpurple--coding--agent-blue)](https://hub.docker.com/r/rimodock/purple-coding-agent)
 
-An **MCTS-guided software engineering agent** built for the [AgentX–AgentBeats](https://rdi.berkeley.edu/agentx-agentbeats) Phase 2 competition (Coding Agent track). Evaluated against **AgentSWE** (SWE-bench Pro).
+A **multi-turn software engineering agent** built for the [AgentX–AgentBeats](https://rdi.berkeley.edu/agentx-agentbeats) Phase 2 competition (Coding Agent track), evaluated against **AgentSWE** on **SWE-bench Pro**.
 
 ---
 
 ## Architecture Overview
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                    PURPLE AGENT                             │
-│                                                            │
-│  ┌──────────────┐    ┌────────────────┐    ┌───────────┐  │
-│  │  A2A Server  │───▶│   MCTS Engine  │───▶│    PRM    │  │
-│  │  (FastAPI)   │    │  (UCT select)  │    │ (scorer)  │  │
-│  └──────────────┘    └────────────────┘    └───────────┘  │
-│          │                   │                             │
-│          ▼                   ▼                             │
-│  ┌──────────────┐    ┌────────────────┐                   │
-│  │  State Mgr   │    │   LLM Client   │                   │
-│  │  (per node)  │    │  (vLLM/HF)     │                   │
-│  └──────────────┘    └────────────────┘                   │
-│                              │                             │
-└──────────────────────────────│─────────────────────────────┘
-                               ▼
-                  ┌────────────────────────┐
-                  │   vLLM / Unsloth       │
-                  │  Gemma-4-31B-it   │
-                  └────────────────────────┘
-```
+The agent uses a **3-stage pipeline** that combines static analysis, interactive bash exploration, and parallel patch generation:
 
-### Key Components
-
-| Component | File | Purpose |
-|---|---|---|
-| A2A Server | `src/server.py` | FastAPI HTTP server implementing the A2A protocol |
-| Agent Core | `src/agent.py` | Orchestrates MCTS + LLM reasoning loop |
-| MCTS Engine | `src/mcts.py` | UCT-based action selection across tree branches |
-| PRM | `src/prm.py` | Programmable Process Reward Model (3-layer scoring) |
-| State Manager | `src/state.py` | Per-branch state (files, discoveries, patch) |
-| LLM Client | `src/llm_client.py` | OpenAI-compatible client + HuggingFace fallback |
-| Prompts | `src/prompts.py` | XML-structured prompts for TIR format |
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     PURPLE CODING AGENT (v3)                    │
+│                                                                 │
+│  ┌─────────────┐                                                │
+│  │  A2A Server │  FastAPI — handles JSON-RPC multi-turn msgs    │
+│  │  (FastAPI)  │                                                │
+│  └──────┬──────┘                                                │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                   STAGE 1 — LOCALIZATION                │   │
+│  │  GitHub Tree API → filter 300 source files →            │   │
+│  │  LLM reasons: "which files contain the bug?" →          │   │
+│  │  Returns JSON array of file paths                       │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              STAGE 2 — BASH EXPLORATION                 │   │
+│  │  Turns 1 to MAX_TURNS-1:                                │   │
+│  │  • LLM decides next bash command (grep, cat, pytest)    │   │
+│  │  • Green agent executes in real repo Docker container   │   │
+│  │  • stdout/stderr returned in next A2A turn              │   │
+│  │  • Full conversation history accumulated                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                STAGE 3 — MCTS REPAIR                    │   │
+│  │  Final turn:                                            │   │
+│  │  • 3 parallel patch candidates (asyncio.gather)         │   │
+│  │  • Temperature diversity: 0.15 → 0.48 → 0.80           │   │
+│  │  • PRM scores each: format + relevance + completeness   │   │
+│  │  • UCT-based MCTS selects highest-scoring valid patch   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Agent Protocol
+## Why Multi-Turn?
 
-This agent implements the [A2A Protocol](https://a2a-protocol.org/) and is compatible with **AgentSWE** (green agent for SWE-bench Verified).
+SWE-bench Pro deliberately withholds test names, requirements, and interface specs. The green agent only sends:
+
+```json
+{
+  "problem_statement": "...",
+  "repo": "ansible/ansible",
+  "base_commit": "abc123..."
+}
+```
+
+Without seeing what the failing test actually checks, single-turn blind patching generates valid diffs that fix the wrong code. Multi-turn bash exploration solves this:
+
+```
+Turn 1 → bash: "cat -n lib/config/cluster.go | head -100"
+Turn 2 ← real file content with real line numbers
+Turn 3 → bash: "go test ./lib/... -run TestClusterConfig --tb=short"
+Turn 4 ← ACTUAL test failure: "expected true, got false at line 67"
+Turn 5 → bash: "grep -n 'isValid' lib/config/cluster.go"
+Turn 6 → patch: informed diff at exact line with exact context
+```
+
+The green agent executes our bash commands in the repo's Docker container and returns stdout/stderr — we get interactive shell access without managing Docker ourselves.
+
+---
+
+## Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| LLM localization over keyword search | Semantics beat syntax — LLM understands "caching bug in cluster config → look in `lib/services/`" |
+| Bash exploration before patching | Real stack traces beat static GitHub snapshots |
+| `asyncio.gather` for MCTS branches | All 3 repair candidates fire simultaneously — same wall-clock time as 1 |
+| `contextId` as session key | Persists across ALL turns; `instance_id` only appears in turn 1 |
+| No `"reasoning"` param in Gemma 4 payload | Causes `content: null` crash; Gemma 4 reasons naturally via `<think>` blocks |
+| Strip `<think>` before patch extraction | Prevents reasoning tokens from corrupting the unified diff |
+
+---
+
+## Repository Structure
+
+```
+purple-coding-agent/
+├── src/
+│   └── server.py            # Complete single-file implementation (v3)
+│                            # Contains: A2A server, localization, bash exploration,
+│                            # MCTS engine, PRM, LLM client, session management
+├── Dockerfile               # Single-stage, linux/amd64
+├── requirements.txt         # fastapi, uvicorn, requests, httpx
+├── amber-manifest.json5     # AgentBeats deployment config
+└── README.md
+```
+
+Everything is in `src/server.py` — no separate modules needed.
+
+---
+
+## Agent Protocol (A2A)
+
+Implements the [A2A Protocol](https://a2a-protocol.org/) spec:
 
 ### Endpoints
 
 ```
-GET  /.well-known/agent.json   # Agent card
-GET  /health                   # Health check
-POST /                         # Handle A2A task message
+GET  /.well-known/agent-card.json   # Agent capability declaration
+GET  /.well-known/agent.json        # Compatibility alias
+GET  /health                        # Health check
+POST /                              # Handle A2A JSON-RPC message (all turns)
 ```
 
-### Interaction Modes
+### Action Types
 
-The agent supports all three AgentSWE modes:
+| Action | When | Content |
+|---|---|---|
+| `bash` | Exploration turns 1 to N-1 | Shell command executed in repo container |
+| `patch` | Final turn | Unified git diff starting with `diff --git` |
 
-| Mode | Usage |
-|---|---|
-| `bash` | Read-only codebase exploration (`find`, `grep`, `cat`, `pytest`) |
-| `debug` | Ephemeral writes to test hypotheses |
-| `patch` | Final unified diff submission |
+### Exploration Prompt Format
 
-### Output Format (TIR)
-
-The LLM is prompted to output structured XML:
+The LLM is instructed to respond in XML during exploration:
 
 ```xml
 <thought>
-Step-by-step analysis. References specific file names and line numbers.
-Verifies reasoning before acting.
+I can see the cluster config caching is done in lib/config/cluster.go.
+The isValidationPending check on line 67 uses stale cache — need to
+force refresh on session renewal.
 </thought>
-<command>bash</command>
+<action>bash</action>
 <content>
-grep -rn "add_to_set" utils/ | head -20
+grep -n "isValidationPending\|cache\|refresh" lib/config/cluster.go | head -30
 </content>
+```
+
+---
+
+## Session Lifecycle
+
+```
+POST / (turn 1)  → extract contextId → create session
+                 → Stage 1: fetch tree → LLM localize → fetch files
+                 → return bash action (explore located files)
+
+POST / (turn 2)  → same contextId → record observation (stdout/stderr)
+                 → LLM decides next bash command
+                 → return bash action
+
+POST / (turns 3-5) → accumulate exploration history
+
+POST / (turn 6)  → MAX_TURNS reached
+                 → Stage 3: MCTS repair with full context
+                 → return patch action
 ```
 
 ---
@@ -89,101 +174,42 @@ grep -rn "add_to_set" utils/ | head -20
 
 ### Prerequisites
 
-- Docker + Docker Compose
-- NVIDIA GPU (for vLLM; 16GB+ VRAM recommended)
-- `HF_TOKEN` environment variable (for gated models)
+- Docker
+- OpenRouter API key (for Gemma 4 31B)
+- GitHub personal access token (for repo tree/file fetching)
 
 ### Run Locally
 
 ```bash
-# 1. Clone
-git clone https://github.com/YOUR_USERNAME/purple-agent
-cd purple-agent
+# Clone
+git clone https://github.com/soutrikmachine/purple-coding-agent
+cd purple-coding-agent
 
-# 2. Start agent + vLLM
-HF_TOKEN=your_token docker compose up
+# Build
+docker buildx build --platform linux/amd64 -t purple-coding-agent:local .
 
-# 3. Verify
+# Run
+docker run -p 9010:9010 \
+  -e OPENROUTER_API_KEY=your_key \
+  -e GITHUB_TOKEN=your_token \
+  purple-coding-agent:local
+
+# Verify
 curl http://localhost:9010/health
-curl http://localhost:9010/.well-known/agent.json
-
-# 4. Send a test task
-curl -X POST http://localhost:9010/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "problem_statement": "Fix the None handling bug in utils/collections.py",
-    "cwd": "/workspace/repo",
-    "fail_to_pass": ["tests/test_collections.py::test_none_handling"]
-  }'
+curl http://localhost:9010/.well-known/agent-card.json
 ```
 
-### Run Tests (no GPU needed)
+### Deploy to AgentBeats
 
 ```bash
-pip install -e ".[dev]"
-pip install httpx pytest-asyncio
-pytest tests/ -v
+# Build and push (M1/M2 Mac cross-compile)
+docker buildx build --no-cache --platform linux/amd64 \
+  -t rimodock/purple-coding-agent:latest --push .
 ```
 
----
-
-## Kaggle 2×T4 Training Guide (22 GPU Hours)
-
-### Week 1 — Foundation & Trajectory Mining (10 Hours)
-
-| Hours | Task | GPU Usage |
-|---|---|---|
-| 1–3 | Start vLLM server + test A2A endpoints | 1 hr |
-| 4–8 | Mine gold trajectories from 60 SWE-bench tasks | 6 hrs |
-| 9–10 | Validate trajectories + PRM calibration | 2 hrs |
-
-```python
-# In Kaggle notebook — start vLLM
-exec(open("scripts/kaggle_notebook.py").read())
-```
-
-### Week 2 — GRPO Training & Sprint Launch (12 Hours)
-
-| Hours | Task | GPU Usage |
-|---|---|---|
-| 11–15 | GRPO fine-tuning with Unsloth MoE kernels | 4 hrs |
-| 16–20 | Re-run full eval with tuned model + MCTS | 4 hrs |
-| 21–22 | Build Docker image, register on AgentBeats | 1 hr |
-
-```bash
-# GRPO training (from Kaggle notebook)
-python scripts/grpo_train.py \
-  --data /kaggle/working/gold_trajectories.jsonl \
-  --output /kaggle/working/grpo_model \
-  --epochs 1 \
-  --lora-r 16
-```
-
----
-
-## Docker Submission
-
-### Build
-
-```bash
-docker build -t purple-agent:latest .
-```
-
-### Push to GHCR (auto via GitHub Actions on push to main)
-
-```bash
-# Manual push
-docker tag purple-agent:latest ghcr.io/YOUR_USERNAME/purple-agent:latest
-docker push ghcr.io/YOUR_USERNAME/purple-agent:latest
-```
-
-### Register on AgentBeats
-
-1. Go to [agentbeats.dev/register-agent](https://agentbeats.dev/register-agent)
-2. Select **Purple**
-3. Set Docker image: `ghcr.io/YOUR_USERNAME/purple-agent:latest`
-4. Add required env vars: `LLM_BASE_URL`, `MODEL_NAME`
-5. Submit against the **AgentSWE** leaderboard
+Then Quick Submit on [agentbeats.dev](https://agentbeats.dev) with secrets:
+- `OPENROUTER_KEY` → your OpenRouter API key
+- `GITHUB_TOKEN` → your GitHub personal access token
 
 ---
 
@@ -191,102 +217,89 @@ docker push ghcr.io/YOUR_USERNAME/purple-agent:latest
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_BASE_URL` | `http://vllm:8000` | vLLM/OpenAI-compatible endpoint |
-| `MODEL_NAME` | `google/gemma-4-31b-it` | Model ID |
-| `MAX_TURNS` | `15` | Max turns per task |
-| `MCTS_BRANCHES` | `3` | Candidate actions per MCTS step |
-| `TEMPERATURE` | `0.6` | LLM sampling temperature |
-| `USE_MCTS` | `true` | Enable/disable MCTS (disable for speed) |
-| `PORT` | `9010` | Purple agent server port |
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible LLM endpoint |
+| `MODEL_NAME` | `google/gemma-4-31b-it` | Model ID on OpenRouter |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (set as secret) |
+| `GITHUB_TOKEN` | — | GitHub PAT for tree/file API (set as secret) |
+| `PORT` | `9010` | Agent server port |
+| `MAX_TURNS` | `6` | Bash exploration turns before forcing patch |
+| `MCTS_BRANCHES` | `3` | Parallel patch candidates in Stage 3 |
+| `USE_MCTS` | `true` | Enable MCTS selection (false = greedy) |
 
 ---
 
-## MCTS Search Strategy
+## MCTS Patch Selection
 
-The agent uses **UCT (Upper Confidence Trees)** to balance exploration vs exploitation across candidate actions:
+On the final turn, 3 patch candidates are generated simultaneously via `asyncio.gather` with temperature diversity:
 
-$$UCT(j) = \bar{V}_j + c\sqrt{\frac{\ln N}{n_j}}$$
+$$T_i = 0.15 + \frac{0.65}{N-1} \cdot i \quad \text{for } i \in \{0, 1, 2\}$$
 
-Where:
-- $\bar{V}_j$ = average PRM reward of node $j$
-- $N$ = parent visit count
-- $n_j$ = node visit count  
-- $c = \sqrt{2}$ (exploration constant)
+Giving temperatures **[0.15, 0.48, 0.80]** — conservative, balanced, creative.
 
-At each turn:
-1. LLM samples **3 candidate actions** (bash/debug/patch)
-2. **Programmable PRM** scores each statically (format + relevance)
-3. **UCT** selects the best branch to execute
-4. After observation, reward is backpropagated through the tree
-
----
-
-## Reward Model (PRM)
-
-Three-layer scoring ∈ [0, 1]:
+Each candidate is scored by the **Programmable Reward Model (PRM)**:
 
 | Layer | Weight | Signal |
 |---|---|---|
-| Format ($R_f$) | 20% | Valid XML structure, correct command type |
-| Relevance ($R_l$) | 35% | Content mentions problem-relevant tokens/files |
-| Execution ($R_e$) | 45% | Test pass/fail, file discovery, error absence |
+| Format | 35% | Valid `diff --git` structure, `@@` hunks, `+`/`-` lines |
+| Relevance | 35% | Overlap between patch tokens and problem statement |
+| Completeness | 30% | Non-empty, non-truncated diff |
+
+UCT-based MCTS selects the highest-scoring candidate and backpropagates the reward.
 
 ---
 
-## GRPO Training Details
+## Benchmark Context
 
-Fine-tuning uses **Unsloth's MoE Triton Kernels** for 7× speed and 35% less VRAM:
+| Benchmark | Our Agent | SOTA |
+|---|---|---|
+| SWE-bench Pro | 0.0% (work in progress) | 58.6% (Kimi-K2.6) |
+| SWE-bench Verified | not yet evaluated | ~70%+ |
 
-```python
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="google/gemma-4-31b-it",
-    max_seq_length=8192,
-    load_in_4bit=True,
-)
-```
+SWE-bench Pro is the hardest coding benchmark — average gold patch is **107 lines across 4.1 files**, and every task deliberately excludes trivially solvable bugs. Even GPT-5 scores ~23%.
 
-Reward functions:
-- `reward_format` — XML structure validation
-- `reward_logic` — TIR file-path grounding
-- `reward_patch` — Diff format correctness
+Current status: patches apply cleanly (`pass_to_pass_ok: True`) but fix the wrong code (`fail_to_pass_ok: False`). Multi-turn exploration is the structural fix for this.
 
 ---
 
-## Project Structure
+## Development History
 
-```
-purple-agent/
-├── src/
-│   ├── server.py          # A2A FastAPI server
-│   ├── agent.py           # Core orchestrator
-│   ├── mcts.py            # MCTS engine (UCT)
-│   ├── prm.py             # Programmable reward model
-│   ├── state.py           # Node state manager
-│   ├── llm_client.py      # vLLM / HuggingFace client
-│   └── prompts.py         # Structured XML prompts
-├── scripts/
-│   ├── grpo_train.py      # GRPO fine-tuning (Week 2)
-│   ├── mine_trajectories.py # Gold trajectory collection (Week 1)
-│   ├── kaggle_notebook.py # Full Kaggle workflow
-│   └── start_vllm.sh      # vLLM server launcher
-├── tests/
-│   └── test_agent.py      # Unit + integration tests
-├── .github/workflows/
-│   └── ci.yml             # CI + Docker build/push
-├── Dockerfile
-├── docker-compose.yml
-├── pyproject.toml
-└── README.md
-```
+| Version | Architecture | Pass Rate |
+|---|---|---|
+| v1 | Single-turn blind patching (keyword file search) | 1% (lucky) |
+| v2 | Two-stage: LLM localization + MCTS repair | 0% (wrong code) |
+| v3 | Three-stage: localization + bash exploration + MCTS | TBD |
+
+Key lessons learned:
+- `pass_to_pass_ok: True` on all tasks — patch format and git apply are correct
+- `fail_to_pass_ok: False` on all tasks — model patches adjacent code, not the bug
+- Green agent withholds `fail_to_pass`, `requirements`, `interface`, `test_patch`
+- Keyword file search fetches semantically wrong files
+- LLM localization (semantic reasoning over repo tree) fetches the right files
+- Without interactive execution, even correct files don't tell you what line to change
 
 ---
 
-## Competition Details
+## Roadmap
+
+- [x] A2A protocol (JSON-RPC, contextId session, correct response format)
+- [x] GitHub file fetching (raw.githubusercontent.com + Tree API)
+- [x] LLM-based semantic localization
+- [x] Async MCTS with PRM scoring
+- [x] Multi-turn bash exploration loop
+- [ ] Validate multi-turn pass rate improvement
+- [ ] Switch to DeepSeek V4 Pro for serious leaderboard submission
+- [ ] Implement GRPO fine-tuning on SWE-bench Lite trajectories
+- [ ] Evaluate on SWE-bench Verified, SWE-bench Lite, Terminal Bench
+
+---
+
+## Competition
 
 - **Competition:** [AgentX–AgentBeats Phase 2](https://rdi.berkeley.edu/agentx-agentbeats)
-- **Track:** Coding Agent (Sprint 3, Apr 13 – May 3)
-- **Green Agent:** [AgentSWE](https://agentbeats.dev/agentbeater/swe-bench) (SWE-bench Pro)
-- **Metric:** Resolved Rate (pass@1) + Token Efficiency
+- **Track:** Coding Agent — Sprint 3 (Apr 13 – May 3, 2026)
+- **Evaluation:** SWE-bench Pro (100 tasks, 20 shards)
+- **Metric:** Pass rate — `fail_to_pass_ok` across all instances
+- **Leaderboard:** [agentbeats.dev/agentbeater/swe-bench](https://agentbeats.dev/agentbeater/swe-bench)
 
 ---
 

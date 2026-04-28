@@ -1,27 +1,35 @@
 """
-Purple Coding Agent — Two-Stage Pipeline
-==========================================
-Stage 1: LLM LOCALIZATION
-  - Fetch repo tree from GitHub
-  - Ask LLM: "Given this problem, which files need to change?"
-  - LLM returns JSON list of file paths with reasoning
-  - Fetch those exact files
+Purple Coding Agent — Multi-Turn Pipeline (v3)
+================================================
+3-Stage Architecture:
 
-Stage 2: MCTS REPAIR
-  - 6 parallel branches, each with actual file content
-  - PRM scores by patch validity
-  - Return highest-scoring patch
+STAGE 1 — LLM LOCALIZATION (Turn 1, via GitHub API)
+  - Fetch repo tree
+  - LLM reasons: "which files need changing?"
+  - Returns bash action to explore those files in the real repo
 
-Why this beats keyword search:
-  LLMs understand semantics — "caching bug in cluster config →
-  look in lib/services/ not lib/client/" — keyword matching cannot.
+STAGE 2 — BASH EXPLORATION (Turns 2 to MAX_TURNS-1)
+  - Each turn: receive stdout/stderr from green agent's shell
+  - LLM decides next bash command based on accumulated context
+  - Builds a rich understanding of actual code state
+  - Commands: cat, grep, find, python -m pytest, git log, etc.
 
-Facts established from logs:
-  - Green agent sends: problem_statement, repo, base_commit only
-  - fail_to_pass, requirements, interface are always empty
-  - pass_to_pass_ok always True (patches apply)
-  - fail_to_pass_ok always False (wrong code patched)
-  - Root cause: we were fetching wrong files via keyword guessing
+STAGE 3 — MCTS REPAIR (Final turn)
+  - 3 parallel patch branches using all exploration context
+  - PRM selects the highest-scoring valid diff
+  - Returns patch
+
+Why multi-turn beats single-turn:
+  The model sees real stack traces, real function bodies at exact line
+  numbers, real test failure messages — not guesses from static GitHub
+  snapshots. One "pytest --tb=short" output tells you more than all
+  the file fetching we did before.
+
+Green agent behavior (confirmed from logs):
+  - Sends: problem_statement, repo, base_commit, instance_id
+  - Executes bash actions in the repo's Docker container
+  - Returns stdout/stderr in next turn's message
+  - Withholds: fail_to_pass, requirements, interface, test_patch
 """
 
 from __future__ import annotations
@@ -34,7 +42,6 @@ import os
 import re
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -64,6 +71,7 @@ API_KEY       = (
 )
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
+MAX_TURNS     = int(os.getenv("MAX_TURNS", "6"))   # turns 1-5 bash, turn 6 patch
 MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "3"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
 
@@ -78,52 +86,47 @@ logger.info("Purple Agent  model=%s", MODEL_NAME)
 logger.info("Chat URL      %s", CHAT_URL)
 logger.info("API Key       %s", "SET ✓" if API_KEY else "MISSING ✗")
 logger.info("GitHub Token  %s", "SET ✓" if GITHUB_TOKEN else "NOT SET")
-logger.info("MCTS          branches=%d  enabled=%s", MCTS_BRANCHES, USE_MCTS)
+logger.info("Multi-turn    MAX_TURNS=%d  MCTS_BRANCHES=%d",
+            MAX_TURNS, MCTS_BRANCHES)
 logger.info("=" * 60)
 
 
 # ==============================================================================
-# GITHUB HELPERS
+# GITHUB HELPERS  (Stage 1 only — tree + localization)
 # ==============================================================================
 
 def _github_headers() -> dict:
-    h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    h = {"Accept": "application/vnd.github+json",
+         "X-GitHub-Api-Version": "2022-11-28"}
     if GITHUB_TOKEN:
         h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return h
 
 
 def fetch_file_raw(repo: str, ref: str, filepath: str) -> str:
-    """Fetch raw file content from raw.githubusercontent.com."""
-    ref = ref or "HEAD"
-    url = f"https://raw.githubusercontent.com/{repo}/{ref}/{filepath}"
-    headers = {}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    """Fetch a single file from raw.githubusercontent.com."""
+    url = f"https://raw.githubusercontent.com/{repo}/{ref or 'HEAD'}/{filepath}"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as r:
             if r.status == 200:
-                content = r.read().decode("utf-8", errors="replace")
-                logger.info("Fetched: %s (%d chars)", filepath, len(content))
-                return content
+                return r.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        logger.warning("GitHub 404: %s (HTTP %d)", filepath, e.code)
+        logger.warning("GitHub 404: %s (%d)", filepath, e.code)
     except Exception as e:
-        logger.warning("GitHub error: %s — %s", filepath, e)
+        logger.warning("GitHub error %s: %s", filepath, e)
     return ""
 
 
 def get_repo_tree(repo: str, ref: str) -> list[str]:
-    """Get all file paths using GitHub Git Tree API (recursive)."""
-    ref = ref or "HEAD"
-    url = f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1"
+    """Get all blob paths via GitHub Tree API (recursive)."""
+    url = f"https://api.github.com/repos/{repo}/git/trees/{ref or 'HEAD'}?recursive=1"
     try:
         req = urllib.request.Request(url, headers=_github_headers())
         with urllib.request.urlopen(req, timeout=20) as r:
             data  = json.loads(r.read().decode())
-            paths = [item["path"] for item in data.get("tree", [])
-                     if item["type"] == "blob"]
+            paths = [i["path"] for i in data.get("tree", []) if i["type"] == "blob"]
             logger.info("Repo tree: %d files in %s", len(paths), repo)
             return paths
     except Exception as e:
@@ -131,150 +134,125 @@ def get_repo_tree(repo: str, ref: str) -> list[str]:
         return []
 
 
-# ==============================================================================
-# STAGE 1 — LLM LOCALIZATION
-# ==============================================================================
-
-_SOURCE_EXTS = re.compile(
-    r'\.(py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h|php|cs|swift|kt|vue|svelte)$'
-)
-
 _EXCLUDE_DIRS = {
     "vendor", "node_modules", "__pycache__", ".git", "dist", "build",
     "testdata", "fixtures", "migrations", "generated", "proto",
 }
 
+_SOURCE_EXT = re.compile(
+    r'\.(py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h|php|cs|swift|kt|vue|svelte)$'
+)
 
-def _filter_tree_for_llm(paths: list[str], max_paths: int = 300) -> list[str]:
-    """
-    Filter the repo tree to source files only, excluding generated/vendor dirs.
-    Cap at max_paths to fit in LLM context.
-    """
-    filtered = []
-    for p in paths:
-        parts = p.split("/")
-        if any(part in _EXCLUDE_DIRS for part in parts):
-            continue
-        if _SOURCE_EXTS.search(p):
-            filtered.append(p)
-    # If still too many, prefer shorter paths (top-level src more likely relevant)
+
+def _filter_tree(paths: list[str], max_paths: int = 300) -> list[str]:
+    """Filter to source files, exclude vendor/generated dirs, cap at max_paths."""
+    filtered = [
+        p for p in paths
+        if _SOURCE_EXT.search(p)
+        and not any(part in _EXCLUDE_DIRS for part in p.split("/"))
+    ]
     filtered.sort(key=lambda p: (len(p.split("/")), p))
     return filtered[:max_paths]
 
+
+# ==============================================================================
+# STAGE 1 — LLM LOCALIZATION
+# ==============================================================================
 
 def llm_localize(
     problem_statement: str,
     repo: str,
     tree_paths: list[str],
-    llm_client: "LLMClient",
+    llm: "LLMClient",
 ) -> list[str]:
     """
-    Stage 1: Ask the LLM which files in the repo need to change.
-
-    Returns a list of file paths (up to 6) that the LLM identifies as
-    needing modification to fix the described bug/feature.
+    Ask the LLM: given this bug report and file tree, which files need changing?
+    Returns up to 5 file paths that exist in the tree.
     """
-    if not tree_paths:
+    filtered = _filter_tree(tree_paths, max_paths=300)
+    if not filtered:
         return []
 
-    filtered_paths = _filter_tree_for_llm(tree_paths, max_paths=300)
-    tree_str = "\n".join(filtered_paths)
-
     system = (
-        "You are a senior software engineer performing code localization.\n"
-        "Given a bug report and the repository file tree, identify which source files "
-        "need to be modified to fix the issue.\n"
-        "\n"
-        "RULES:\n"
-        "1. Return ONLY a JSON array of file paths, nothing else\n"
-        "2. Include 3-6 files maximum — the ones most likely to contain the bug\n"
-        "3. Prefer source files over test files\n"
-        "4. Use EXACT paths from the file tree provided\n"
-        "5. Think about which module/package the bug would live in based on the description\n"
-        "\n"
-        'Example output: ["lib/config/cluster.go", "lib/services/auth.go"]'
+        "You are a senior software engineer performing fault localization.\n"
+        "Given a bug report and a repository file tree, identify which source "
+        "files are most likely to contain the bug.\n\n"
+        "Return ONLY a JSON array of file paths. Example:\n"
+        '["lib/config/cluster.go", "lib/services/auth/login.go"]\n\n'
+        "Rules:\n"
+        "- Maximum 5 files\n"
+        "- Use EXACT paths from the file tree\n"
+        "- Prefer source files over test files\n"
+        "- Think about which module/package owns the described behavior"
     )
 
     user = (
         f"Repository: {repo}\n\n"
         f"Bug Report:\n{problem_statement[:3000]}\n\n"
-        f"Repository File Tree:\n{tree_str}\n\n"
-        "Which files need to be modified to fix this? Return a JSON array of file paths."
+        f"File Tree:\n" + "\n".join(filtered) + "\n\n"
+        "Which files need to change? Return a JSON array."
     )
 
-    raw = llm_client.complete(
+    raw = llm.complete(
         [{"role": "system", "content": system},
          {"role": "user",   "content": user}],
-        temperature=0.1,   # Low temp for localization — we want deterministic reasoning
-        max_tokens=512,
+        temperature=0.1,
+        max_tokens=256,
     )
-
     if not raw:
-        logger.warning("Localization LLM call returned empty")
         return []
 
-    # Strip <think> blocks from reasoning models
     raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
 
-    # Extract JSON array from response
-    try:
-        # Try direct parse first
-        paths = json.loads(raw)
-        if isinstance(paths, list):
-            valid = [p for p in paths if isinstance(p, str) and p in set(tree_paths)]
-            logger.info("Localization found %d valid paths: %s", len(valid), valid)
-            return valid[:6]
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Try extracting JSON array from within text
-    m = re.search(r'\[.*?\]', raw, re.DOTALL)
-    if m:
+    tree_set = set(tree_paths)
+    for attempt in [raw, re.search(r'\[.*?\]', raw, re.DOTALL)]:
+        text = attempt if isinstance(attempt, str) else (attempt.group(0) if attempt else "")
         try:
-            paths = json.loads(m.group(0))
+            paths = json.loads(text)
             if isinstance(paths, list):
-                valid = [p for p in paths if isinstance(p, str) and p in set(tree_paths)]
-                logger.info("Localization (extracted) found %d paths: %s", len(valid), valid)
-                return valid[:6]
+                valid = [p for p in paths if isinstance(p, str) and p in tree_set]
+                logger.info("Localization → %s", valid)
+                return valid[:5]
         except (json.JSONDecodeError, ValueError):
-            pass
-
-    logger.warning("Could not parse localization response: %s", raw[:200])
+            continue
+    logger.warning("Localization parse failed: %s", raw[:150])
     return []
 
 
-def fetch_located_files(
-    task: "SWETask",
-    located_paths: list[str],
-) -> dict[str, str]:
-    """
-    Fetch the files identified by LLM localization.
-    Falls back to keyword-based fetching if localization returns nothing.
-    """
-    ref   = task.base_commit or "HEAD"
-    files: dict[str, str] = {}
+# ==============================================================================
+# TASK & SESSION MODEL
+# ==============================================================================
 
-    # Fetch LLM-located files
-    for fp in located_paths:
-        content = fetch_file_raw(task.repo, ref, fp)
-        if content:
-            files[fp] = content
+@dataclass
+class SWETask:
+    problem_statement: str
+    cwd: str = "/workspace/repo"
+    hints_text: str = ""
+    repo: str = ""
+    instance_id: str = ""
+    base_commit: str = ""
 
-    # Fallback: any explicitly named files in problem statement
-    if len(files) < 2:
-        ps_paths = re.findall(
-            r'(?:^|[\s`"\'(])([\w][\w/.-]+\.(?:py|go|js|ts|tsx|jsx|java|rb|rs|c|cpp|h))',
-            task.problem_statement,
-            re.MULTILINE,
-        )
-        for fp in [p.strip() for p in ps_paths][:4]:
-            if fp and fp not in files:
-                content = fetch_file_raw(task.repo, ref, fp)
-                if content:
-                    files[fp] = content
 
-    logger.info("Fetched %d files total for %s", len(files), task.repo)
-    return files
+@dataclass
+class Observation:
+    """One round of bash output from the green agent."""
+    command: str
+    stdout: str
+    stderr: str
+
+    def render(self) -> str:
+        parts = [f"$ {self.command}"]
+        if self.stdout.strip():
+            out = self.stdout.strip()
+            if len(out) > 3000:
+                out = out[:1500] + "\n…[truncated]…\n" + out[-500:]
+            parts.append(out)
+        if self.stderr.strip():
+            err = self.stderr.strip()
+            if len(err) > 800:
+                err = err[:400] + "\n…[truncated]…\n" + err[-200:]
+            parts.append(f"[stderr] {err}")
+        return "\n".join(parts)
 
 
 # ==============================================================================
@@ -309,43 +287,38 @@ class MCTSNode:
         self._value_sum += reward
 
     def best_child(self) -> "MCTSNode | None":
-        return max(self.children, key=lambda c: c.uct(self._visits)) if self.children else None
+        return max(self.children, key=lambda c: c.uct(self._visits)) \
+               if self.children else None
 
 
 class MCTSEngine:
-    def __init__(self, root: MCTSNode, branches: int = 3):
-        self.root     = root
+    def __init__(self, branches: int = 3):
+        self.root     = MCTSNode(state={})
         self.branches = branches
-        self._current = root
+        self._current = self.root
         self._pending: MCTSNode | None = None
 
-    def select_action(self, candidates: list[tuple[dict, float]]) -> dict:
-        for action, score in candidates:
-            child = MCTSNode(state=self._current.state.copy(),
-                             parent=self._current, action=action)
+    def select(self, candidates: list[tuple[str, float]]) -> str:
+        """Add candidate patches as children and return the UCT-best one."""
+        for patch, score in candidates:
+            child = MCTSNode(state={}, parent=self._current,
+                             action={"patch": patch})
             child.update(score)
             self._current.children.append(child)
         best = self._current.best_child()
         if best is None:
             return candidates[0][0]
         self._pending = best
-        return best.action
+        return best.action["patch"]
 
     def backpropagate(self, reward: float):
         node = self._pending or self._current
-        while node is not None:
+        while node:
             node.update(reward)
             node = node.parent
         if self._pending:
             self._current = self._pending
             self._pending = None
-
-    def stats(self) -> dict:
-        return {"root_value": round(self.root.value, 3)}
-
-    @staticmethod
-    def _count(n: MCTSNode) -> int:
-        return 1 + sum(MCTSEngine._count(c) for c in n.children)
 
 
 # ==============================================================================
@@ -355,60 +328,36 @@ class MCTSEngine:
 class ProgrammablePRM:
     """Score a patch candidate without executing it."""
 
-    def score(self, content: str, task: "SWETask") -> float:
-        if not content.strip():
+    def score(self, patch: str, task: SWETask) -> float:
+        if not patch.strip():
             return 0.0
-        score = 0.0
-        score += 0.30 * self._format(content)
-        score += 0.40 * self._relevance(content, task)
-        score += 0.30 * self._completeness(content)
-        return min(score, 1.0)
+        return (
+            0.35 * self._format(patch)
+            + 0.35 * self._relevance(patch, task)
+            + 0.30 * self._completeness(patch)
+        )
 
-    def _format(self, content: str) -> float:
-        """Is it a valid unified diff?"""
-        has_header = "diff --git" in content
-        has_hunk   = "@@" in content
-        has_minus  = bool(re.search(r'^-[^-]', content, re.MULTILINE))
-        has_plus   = bool(re.search(r'^\+[^\+]', content, re.MULTILINE))
-        has_lf     = "\n" in content
-        return (0.3 * has_header + 0.2 * has_hunk +
-                0.2 * has_minus + 0.2 * has_plus + 0.1 * has_lf)
+    def _format(self, patch: str) -> float:
+        return min(
+            0.3 * ("diff --git" in patch)
+            + 0.2 * ("@@" in patch)
+            + 0.2 * bool(re.search(r'^-[^-]', patch, re.MULTILINE))
+            + 0.2 * bool(re.search(r'^\+[^\+]', patch, re.MULTILINE))
+            + 0.1 * ("\n" in patch),
+            1.0,
+        )
 
-    def _relevance(self, content: str, task: "SWETask") -> float:
-        """Does the patch touch files/terms related to the problem?"""
-        if not task.problem_statement:
-            return 0.5
+    def _relevance(self, patch: str, task: SWETask) -> float:
         ps_tok = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
-        ct_tok = set(re.findall(r'\b\w{4,}\b', content.lower()))
+        ct_tok = set(re.findall(r'\b\w{4,}\b', patch.lower()))
         if not ps_tok:
             return 0.5
-        return min(len(ps_tok & ct_tok) / max(len(ps_tok) * 0.5, 1), 1.0)
+        return min(len(ps_tok & ct_tok) / max(len(ps_tok) * 0.4, 1), 1.0)
 
-    def _completeness(self, content: str) -> float:
-        """Does the patch look complete (not truncated)?"""
-        lines   = content.strip().splitlines()
-        n_plus  = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
-        n_minus = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
-        if n_plus == 0 and n_minus == 0:
-            return 0.0
-        # Penalize empty patches or single-char patches
-        if len(content.strip()) < 50:
-            return 0.1
-        return 1.0
-
-
-# ==============================================================================
-# TASK MODEL
-# ==============================================================================
-
-@dataclass
-class SWETask:
-    problem_statement: str
-    cwd: str = "/workspace/repo"
-    hints_text: str = ""
-    repo: str = ""
-    instance_id: str = ""
-    base_commit: str = ""
+    def _completeness(self, patch: str) -> float:
+        lines  = patch.strip().splitlines()
+        n_plus = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+        return 0.0 if n_plus == 0 else (0.2 if len(patch) < 50 else 1.0)
 
 
 # ==============================================================================
@@ -428,22 +377,24 @@ class LLMClient:
         self,
         messages: list[dict],
         temperature: float = 0.4,
-        max_tokens: int = 2048,
+        max_tokens: int = 1024,
     ) -> str:
         payload: dict[str, Any] = {
             "model":       MODEL_NAME,
             "messages":    messages,
             "temperature": temperature,
             "max_tokens":  max_tokens,
+            # NOTE: Do NOT add "reasoning" parameter — causes content=null in Gemma 4
         }
         for attempt in range(1, 4):
             try:
                 resp = requests.post(
-                    CHAT_URL, json=payload, headers=self._headers, timeout=90
+                    CHAT_URL, json=payload,
+                    headers=self._headers, timeout=90,
                 )
                 logger.info("LLM status: %d", resp.status_code)
                 if resp.status_code == 401:
-                    logger.error("LLM 401 — check OPENROUTER_API_KEY")
+                    logger.error("LLM 401 — check OPENROUTER_API_KEY secret")
                     return ""
                 if resp.status_code == 429:
                     time.sleep(5 * attempt)
@@ -452,6 +403,9 @@ class LLMClient:
                     logger.error("LLM %d: %s", resp.status_code, resp.text[:300])
                     return ""
                 content = resp.json()["choices"][0]["message"]["content"]
+                if content is None:
+                    logger.error("LLM returned content=null — check model config")
+                    return ""
                 logger.info("LLM returned %d chars", len(content))
                 return content
             except requests.RequestException as e:
@@ -464,102 +418,160 @@ class LLMClient:
 
 
 # ==============================================================================
-# STAGE 2 — PATCH GENERATION
+# PROMPT BUILDERS
 # ==============================================================================
 
-def _build_file_context(files: dict[str, str], task: SWETask) -> str:
-    """Build the file context block for the repair prompt."""
-    if not files:
-        return "(No files fetched — patch based on problem description only)"
+# System prompt shared across all bash exploration turns
+_EXPLORE_SYSTEM = """\
+You are an expert software engineer debugging a real GitHub issue in a live repository.
+You have an interactive bash shell in the project root.
 
-    sections = []
-    for filepath, content in files.items():
-        # Extract the most relevant 100-line window without line numbers
-        window = _relevant_window(content, task, window=100)
-        sections.append(f"### {filepath}\n```\n{window}\n```")
+Work in two phases:
+  EXPLORE — run bash commands to understand the bug
+  PATCH   — when ready, output the final unified diff
 
-    return (
-        "## SOURCE FILES (copy context lines CHARACTER-FOR-CHARACTER):\n\n"
-        + "\n\n".join(sections)
-    )
+ALWAYS respond in this exact XML format:
+<thought>
+Your step-by-step reasoning. What did you learn? What do you need next?
+</thought>
+<action>bash|patch</action>
+<content>
+bash command OR unified diff here
+</content>
 
+EXPLORATION STRATEGY:
+1. Use grep to find the exact functions/methods mentioned in the bug report
+2. Use cat -n to read files with real line numbers
+3. Run the relevant tests with: python -m pytest <path> -x --tb=short 2>&1 | head -50
+   or for Go: go test ./... -run <TestName> 2>&1 | head -50
+4. Trace the actual error to the exact line before patching
 
-def _relevant_window(content: str, task: SWETask, window: int = 100) -> str:
-    """Return the most bug-relevant window of lines from a file."""
-    lines = content.splitlines()
-    if len(lines) <= window:
-        return content
+BASH RULES:
+- Commands must be single-line or use && to chain
+- Prefer: grep -n, cat -n, find, head, tail
+- No destructive commands (rm, dd, git push)
+- Keep output manageable with | head -N
 
-    keywords = set(re.findall(r'\b\w{4,}\b', task.problem_statement.lower()))
-
-    scores = [
-        len(keywords & set(re.findall(r'\b\w{4,}\b', line.lower())))
-        for line in lines
-    ]
-
-    best_start, best_score = 0, -1
-    step = max(1, (len(lines) - window) // 20)
-    for start in range(0, len(lines) - window + 1, step):
-        ws = sum(scores[start:start + window])
-        if ws > best_score:
-            best_score, best_start = ws, start
-
-    selected = lines[best_start:best_start + window]
-    header   = f"[Lines {best_start+1}–{best_start+len(selected)} of {len(lines)}]\n"
-    return header + "\n".join(selected)
+PATCH RULES (when action=patch):
+- Start with: diff --git a/file b/file
+- Copy context lines CHARACTER-FOR-CHARACTER from what cat -n showed you
+- Include exactly 3 unchanged context lines before/after each change
+- No markdown fences, no explanation — raw diff only
+"""
 
 
-def _build_repair_messages(
+def _build_explore_messages(
     task: SWETask,
-    files: dict[str, str],
+    history: list[Observation],
     located_paths: list[str],
+    turn: int,
+    max_turns: int,
 ) -> list[dict]:
-    """Build the prompt for Stage 2 patch generation."""
-
-    file_context = _build_file_context(files, task)
+    """Build the conversation history for the exploration LLM."""
 
     located_hint = ""
     if located_paths:
         located_hint = (
-            f"\n\nFiles identified as needing changes:\n"
+            "\n\nFiles most likely needing changes (from static analysis):\n"
+            + "\n".join(f"  {p}" for p in located_paths)
+        )
+
+    turns_left = max_turns - turn
+    urgency = (
+        f"\n\n⚠️  {turns_left} turn(s) remaining. "
+        + ("Switch to <action>patch</action> NOW." if turns_left <= 1
+           else "Gather the minimum info needed, then patch.")
+    )
+
+    # First user message: the bug report
+    first_user = (
+        f"Repository: {task.repo}  (commit: {task.base_commit or 'HEAD'})\n\n"
+        f"## Bug Report\n\n{task.problem_statement[:2500]}"
+        f"{located_hint}{urgency}"
+    )
+
+    messages: list[dict] = [
+        {"role": "system", "content": _EXPLORE_SYSTEM},
+        {"role": "user",   "content": first_user},
+    ]
+
+    # Replay full conversation history
+    for obs in history:
+        # Assistant sent a bash command
+        messages.append({
+            "role":    "assistant",
+            "content": (
+                f"<thought>Exploring...</thought>\n"
+                f"<action>bash</action>\n"
+                f"<content>{obs.command}</content>"
+            ),
+        })
+        # User (green agent) returned output
+        messages.append({
+            "role":    "user",
+            "content": obs.render() + "\n\nWhat is your next action?",
+        })
+
+    return messages
+
+
+def _build_repair_messages(
+    task: SWETask,
+    history: list[Observation],
+    located_paths: list[str],
+    fetched_files: dict[str, str],
+) -> list[dict]:
+    """
+    Build the final patch generation prompt.
+    Includes full exploration history so the model has maximum context.
+    """
+    # Format exploration history as a readable log
+    exploration_log = ""
+    if history:
+        parts = []
+        for obs in history:
+            parts.append(obs.render())
+        exploration_log = (
+            "\n\n## Exploration History (bash commands + real output)\n\n"
+            + "\n\n".join(parts)
+        )
+
+    # Add any statically fetched files as fallback context
+    file_context = ""
+    if fetched_files:
+        sections = []
+        for fp, content in fetched_files.items():
+            lines = content.splitlines()
+            if len(lines) > 120:
+                content = "\n".join(lines[:120]) + f"\n[...{len(lines)-120} more lines]"
+            sections.append(f"### {fp}\n```\n{content}\n```")
+        file_context = "\n\n## Static File Context\n\n" + "\n\n".join(sections)
+
+    located_hint = ""
+    if located_paths:
+        located_hint = (
+            "\n\nFiles identified for modification:\n"
             + "\n".join(f"  - {p}" for p in located_paths)
         )
 
     system = (
-        "You are an expert software engineer fixing a real GitHub issue.\n"
-        f"Repository: {task.repo}\n"
-        f"Commit: {task.base_commit or 'HEAD'}\n"
-        f"\n{file_context}\n"
-        "\n"
-        "RULES:\n"
-        "1. Output ONLY a unified diff starting with: diff --git\n"
-        "2. Copy context lines CHARACTER-FOR-CHARACTER from the files above\n"
-        "   One character difference will break git apply\n"
-        "3. The patch may span multiple files — include ALL necessary changes\n"
-        "4. Include exactly 3 unchanged context lines before/after each change\n"
-        "5. No <think> tags, no markdown fences, no explanation — raw diff only\n"
-        "\n"
-        "DIFF FORMAT:\n"
-        "diff --git a/path/file.go b/path/file.go\n"
-        "--- a/path/file.go\n"
-        "+++ b/path/file.go\n"
-        "@@ -42,7 +42,8 @@\n"
-        " context\n"
-        " context\n"
-        " context\n"
-        "-old line\n"
-        "+new line\n"
-        " context\n"
-        " context\n"
-        " context\n"
+        "You are an expert software engineer. Based on your exploration, "
+        "generate the exact patch to fix the described bug.\n\n"
+        "OUTPUT FORMAT: unified diff ONLY, starting with diff --git\n"
+        "- Copy context lines CHARACTER-FOR-CHARACTER from what you saw\n"
+        "- Include exactly 3 unchanged context lines before/after changes\n"
+        "- May span multiple files\n"
+        "- No <think> tags, no markdown fences, no explanation\n"
     )
 
     user = (
-        f"## Problem\n\n{task.problem_statement[:2500]}"
+        f"Repository: {task.repo}  commit: {task.base_commit or 'HEAD'}\n\n"
+        f"## Bug Report\n\n{task.problem_statement[:2000]}"
         f"{located_hint}"
+        f"{exploration_log}"
+        f"{file_context}\n\n"
+        "Now output the final unified diff patch:"
     )
-    if task.hints_text:
-        user += f"\n\n## Hints\n{task.hints_text[:400]}"
 
     return [
         {"role": "system", "content": system},
@@ -567,26 +579,41 @@ def _build_repair_messages(
     ]
 
 
+# ==============================================================================
+# PATCH EXTRACTION
+# ==============================================================================
+
 def _extract_patch(raw: str) -> str:
-    """Extract a valid unified diff from LLM output."""
+    """Extract a clean unified diff from LLM output."""
     if not raw:
         return ""
-
-    # Strip Gemma4 <think> blocks
     raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-
-    # Strip markdown fences
     if "```" in raw:
         m = re.search(r"```(?:diff|patch)?\n(.*?)```", raw, re.DOTALL)
         if m:
             raw = m.group(1).strip()
-
-    # Find diff block
     if not (raw.startswith("diff --git") or raw.startswith("--- ")):
         m = re.search(r"(diff --git.*)", raw, re.DOTALL)
         raw = m.group(1).strip() if m else ""
-
     return raw
+
+
+def _parse_action(raw: str) -> tuple[str, str]:
+    """Parse <action> and <content> tags from LLM response."""
+    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+
+    def tag(t: str) -> str:
+        m = re.search(rf'<{t}>(.*?)</{t}>', raw, re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    action  = tag("action").lower() or "bash"
+    content = tag("content") or ""
+
+    if action not in ("bash", "patch"):
+        # Heuristic fallback
+        action = "patch" if ("diff --git" in content or "--- a/" in content) else "bash"
+
+    return action, content
 
 
 # ==============================================================================
@@ -595,36 +622,41 @@ def _extract_patch(raw: str) -> str:
 
 class PurpleAgent:
     """
-    Two-stage agent:
-      Stage 1: LLM localization (which files?)
-      Stage 2: MCTS repair (3 parallel patch candidates, pick best)
+    Multi-turn agent with 3-stage pipeline:
+      Stage 1: LLM localization (GitHub tree → LLM → file paths)
+      Stage 2: Bash exploration (interactive shell in repo Docker container)
+      Stage 3: MCTS repair (parallel patch generation with PRM selection)
     """
 
     def __init__(self):
         self.llm      = LLMClient()
         self.prm      = ProgrammablePRM()
-        self.mcts     = MCTSEngine(MCTSNode(state={}), branches=MCTS_BRANCHES)
         self._sessions: dict[str, dict[str, Any]] = {}
 
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def respond(self, message: dict) -> dict:
+        """Entry point called from FastAPI handler (runs in thread pool)."""
         session_id = (
             message.get("session_id")
             or message.get("instance_id")
             or str(abs(hash(message.get("problem_statement", "")[:80])))
         )
 
-        # Use cached session to avoid re-doing localization on repeat calls
         if session_id not in self._sessions:
             session = self._init_session(session_id, message)
         else:
             session = self._sessions[session_id]
+            # Record observation from previous bash action
+            self._record_observation(session, message)
 
         try:
-            # asyncio.run is safe here — called from run_in_executor thread
-            return asyncio.run(self._run(session))
+            return asyncio.run(self._step(session))
         except Exception as e:
             logger.exception("[%s] Agent crashed: %s", session_id[:20], e)
             return {"action": "patch", "content": ""}
+
+    # ── Session Management ────────────────────────────────────────────────────
 
     def _init_session(self, session_id: str, message: dict) -> dict:
         task = SWETask(
@@ -636,90 +668,181 @@ class PurpleAgent:
             base_commit=message.get("base_commit", ""),
         )
         session = {
-            "id":            session_id,
-            "task":          task,
-            "located_paths": None,  # set after localization
-            "fetched_files": None,  # set after fetching
+            "id":             session_id,
+            "task":           task,
+            "turn":           0,
+            "history":        [],           # list[Observation]
+            "last_command":   "",           # last bash command sent
+            "located_paths":  None,         # set after Stage 1
+            "fetched_files":  {},           # static files from GitHub
+            "mcts":           MCTSEngine(branches=MCTS_BRANCHES),
         }
         self._sessions[session_id] = session
-        logger.info("[%s] New session repo=%s commit=%s",
+        logger.info("[%s] New session  repo=%s  commit=%s",
                     session_id[:20], task.repo,
                     task.base_commit[:12] if task.base_commit else "HEAD")
         return session
 
-    async def _run(self, session: dict) -> dict:
+    def _record_observation(self, session: dict, message: dict):
+        """Store stdout/stderr returned by the green agent into session history."""
+        stdout = message.get("stdout", "").strip()
+        stderr = message.get("stderr", "").strip()
+        if stdout or stderr:
+            obs = Observation(
+                command=session.get("last_command", ""),
+                stdout=stdout,
+                stderr=stderr,
+            )
+            session["history"].append(obs)
+            logger.info("[%s] Observation recorded: stdout=%d chars stderr=%d chars",
+                        session["id"][:20], len(stdout), len(stderr))
+
+    # ── Main Step Logic ───────────────────────────────────────────────────────
+
+    async def _step(self, session: dict) -> dict:
+        """Decide and return the next action for this turn."""
+        session["turn"] += 1
+        turn  = session["turn"]
+        task  = session["task"]
+
+        logger.info("[%s] Turn %d/%d", session["id"][:20], turn, MAX_TURNS)
+
+        # ── Stage 1: Localization on first turn ───────────────────────────────
+        if session["located_paths"] is None:
+            await self._run_localization(session)
+
+        # ── Stage 3: Final turn — MCTS patch generation ───────────────────────
+        if turn >= MAX_TURNS:
+            logger.info("[%s] Final turn — running MCTS repair", session["id"][:20])
+            patch = await self._mcts_repair(session)
+            return {"action": "patch", "content": patch}
+
+        # ── Stage 2: Bash exploration ─────────────────────────────────────────
+        bash_cmd = await self._decide_bash(session)
+
+        # If LLM already decided to patch early (it has enough info)
+        if bash_cmd is None:
+            logger.info("[%s] LLM chose to patch early", session["id"][:20])
+            patch = await self._mcts_repair(session)
+            return {"action": "patch", "content": patch}
+
+        session["last_command"] = bash_cmd
+        logger.info("[%s] bash → %s", session["id"][:20], bash_cmd[:120])
+        return {"action": "bash", "content": bash_cmd}
+
+    # ── Stage 1: LLM Localization ─────────────────────────────────────────────
+
+    async def _run_localization(self, session: dict):
+        """Fetch repo tree, ask LLM which files need changing, fetch them."""
         task = session["task"]
 
-        # ── Stage 1: Localization (once per session, cached) ─────────────────
-        if session["located_paths"] is None:
-            tree = await asyncio.to_thread(
-                get_repo_tree, task.repo, task.base_commit or "HEAD"
-            )
-
-            if tree:
-                located = await asyncio.to_thread(
-                    llm_localize,
-                    task.problem_statement,
-                    task.repo,
-                    tree,
-                    self.llm,
-                )
-                session["located_paths"] = located
-                logger.info("[%s] Localization → %s",
-                            session["id"][:20], located)
-            else:
-                session["located_paths"] = []
-                logger.warning("[%s] Tree fetch failed — skipping localization",
-                               session["id"][:20])
-
-        # ── Fetch files (once per session, cached) ────────────────────────────
-        if session["fetched_files"] is None:
-            session["fetched_files"] = await asyncio.to_thread(
-                fetch_located_files, task, session["located_paths"]
-            )
-
-        # ── Stage 2: MCTS patch generation (parallel branches) ───────────────
-        if USE_MCTS:
-            patch = await self._mcts_repair(session)
-        else:
-            patch = await self._greedy_repair(session)
-
-        return {"action": "patch", "content": patch}
-
-    async def _greedy_repair(self, session: dict) -> str:
-        msgs = _build_repair_messages(
-            session["task"],
-            session["fetched_files"],
-            session["located_paths"],
+        tree = await asyncio.to_thread(
+            get_repo_tree, task.repo, task.base_commit or "HEAD"
         )
-        raw = await asyncio.to_thread(self.llm.complete, msgs, 0.2, 2048)
-        return _extract_patch(raw)
+
+        if tree:
+            located = await asyncio.to_thread(
+                llm_localize,
+                task.problem_statement,
+                task.repo,
+                tree,
+                self.llm,
+            )
+            session["located_paths"] = located
+
+            # Fetch located files from GitHub as static context fallback
+            ref = task.base_commit or "HEAD"
+            for fp in located[:4]:
+                content = await asyncio.to_thread(
+                    fetch_file_raw, task.repo, ref, fp
+                )
+                if content:
+                    session["fetched_files"][fp] = content
+                    logger.info("Fetched: %s (%d chars)", fp, len(content))
+        else:
+            session["located_paths"] = []
+            logger.warning("[%s] Tree fetch failed", session["id"][:20])
+
+    # ── Stage 2: Bash Exploration ─────────────────────────────────────────────
+
+    async def _decide_bash(self, session: dict) -> str | None:
+        """
+        Ask the LLM what bash command to run next.
+        Returns None if the LLM wants to switch to patching.
+        """
+        msgs = _build_explore_messages(
+            session["task"],
+            session["history"],
+            session["located_paths"] or [],
+            session["turn"],
+            MAX_TURNS,
+        )
+
+        raw = await asyncio.to_thread(
+            self.llm.complete, msgs, 0.3, 512
+        )
+        if not raw:
+            # Fallback: run a basic exploration command
+            return self._fallback_bash(session)
+
+        action, content = _parse_action(raw)
+
+        if action == "patch":
+            # LLM wants to patch — let MCTS handle it
+            return None
+
+        if not content.strip():
+            return self._fallback_bash(session)
+
+        return content.strip()
+
+    def _fallback_bash(self, session: dict) -> str:
+        """Return a sensible exploration command when LLM gives no output."""
+        task     = session["task"]
+        turn     = session["turn"]
+        located  = session.get("located_paths") or []
+        history  = session["history"]
+
+        if turn == 1 and located:
+            # First turn: read the first located file
+            return f"cat -n {located[0]} | head -100"
+        elif turn == 2:
+            # Second turn: search for keywords from problem statement
+            keywords = re.findall(r'\b[A-Z][a-zA-Z]{4,}\b', task.problem_statement)[:3]
+            if keywords:
+                return f"grep -rn '{keywords[0]}' --include='*.py' --include='*.go' . | head -30"
+            return "find . -name '*.py' -o -name '*.go' | head -30"
+        elif len(history) == 0:
+            return "ls -la"
+        else:
+            return "find . -name '*.py' | xargs grep -l 'error\\|Error' | head -10"
+
+    # ── Stage 3: MCTS Repair ──────────────────────────────────────────────────
 
     async def _mcts_repair(self, session: dict) -> str:
         """
-        Run MCTS_BRANCHES patch candidates in parallel.
-        Temperatures span 0.15–0.95 for diversity.
-        Return the highest PRM-scoring valid patch.
+        Generate MCTS_BRANCHES patch candidates in parallel.
+        Temperature schedule spans 0.15 → 0.80 for diversity.
+        PRM selects the highest-scoring valid patch.
         """
         task = session["task"]
         msgs = _build_repair_messages(
             task,
+            session["history"],
+            session["located_paths"] or [],
             session["fetched_files"],
-            session["located_paths"],
         )
 
-        # Temperature schedule: branch 0 is conservative, branch N-1 is creative
         temps = [
-            0.15 + (0.80 / max(MCTS_BRANCHES - 1, 1)) * i
+            0.15 + (0.65 / max(MCTS_BRANCHES - 1, 1)) * i
             for i in range(MCTS_BRANCHES)
         ]
 
         # Fire all branches simultaneously
-        llm_tasks = [
-            asyncio.to_thread(self.llm.complete, msgs, temp, 2048)
-            for temp in temps
-        ]
-        raws = await asyncio.gather(*llm_tasks)
+        raws = await asyncio.gather(*[
+            asyncio.to_thread(self.llm.complete, msgs, t, 2048)
+            for t in temps
+        ])
 
         candidates: list[tuple[str, float]] = []
         for i, raw in enumerate(raws):
@@ -730,18 +853,18 @@ class PurpleAgent:
                         session["id"][:20], i+1, MCTS_BRANCHES,
                         temps[i], score, len(patch))
 
-        # Select best by PRM score
-        best_patch, best_score = max(candidates, key=lambda x: x[1])
+        if not candidates or all(s == 0 for _, s in candidates):
+            logger.warning("[%s] All branches scored 0 — returning best effort",
+                           session["id"][:20])
+            # Return the longest non-empty patch as last resort
+            return max((p for p, _ in candidates if p), key=len, default="")
 
-        # Update MCTS tree
-        best_action = {"action": "patch", "content": best_patch}
-        self.mcts.select_action([({"action": "patch", "content": p}, s)
-                                  for p, s in candidates])
-        self.mcts.backpropagate(best_score)
+        best_patch = session["mcts"].select(candidates)
+        best_score = next(s for p, s in candidates if p == best_patch)
+        session["mcts"].backpropagate(best_score)
 
-        logger.info("[%s] MCTS selected score=%.3f len=%d stats=%s",
-                    session["id"][:20], best_score, len(best_patch),
-                    self.mcts.stats())
+        logger.info("[%s] MCTS selected score=%.3f len=%d",
+                    session["id"][:20], best_score, len(best_patch))
         return best_patch
 
 
@@ -755,11 +878,11 @@ agent = PurpleAgent()
 AGENT_CARD = {
     "name": "Purple Coding Agent",
     "description": (
-        "Two-stage SWE-bench agent: LLM localization + MCTS repair. "
-        "Gemma4-31B + GitHub API."
+        "Multi-turn SWE-bench agent: LLM localization → bash exploration → "
+        "MCTS repair. Gemma 4 31B + GitHub API."
     ),
     "url": f"http://localhost:{PORT}/",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "capabilities": {
         "streaming": False,
         "pushNotifications": False,
@@ -771,8 +894,11 @@ AGENT_CARD = {
         {
             "id": "swe_patch",
             "name": "SWE Patch",
-            "description": "Localize and fix a GitHub issue via unified diff patch.",
-            "tags": ["coding", "swe-bench", "patch"],
+            "description": (
+                "Interactively explore a repository via bash, then generate "
+                "a unified diff patch fixing the described issue."
+            ),
+            "tags": ["coding", "swe-bench", "patch", "multi-turn"],
             "examples": [],
         }
     ],
@@ -791,7 +917,7 @@ async def agent_card_compat():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "agent": "purple-coding-agent", "version": "2.0.0"}
+    return {"status": "ok", "agent": "purple-coding-agent", "version": "3.0.0"}
 
 
 @app.post("/")
@@ -803,31 +929,33 @@ async def handle_task(request: Request):
     artifact_id = str(uuid.uuid4())
 
     logger.info("─" * 50)
-    logger.info("Request id=%s method=%s", jsonrpc_id, body.get("method"))
+    logger.info("Request  id=%s  method=%s", jsonrpc_id, body.get("method"))
 
     task_data, context_id = _extract_task_and_context(body)
     if not context_id:
         context_id = str(uuid.uuid4())
 
+    # Thread context_id as session_id so it persists across ALL turns
     task_data["session_id"] = context_id
 
     ps = task_data.get("problem_statement", "")
-    logger.info("context_id=%s ps_len=%d repo=%s commit=%s",
+    logger.info("context_id=%s  ps_len=%d  repo=%s  commit=%s",
                 context_id[:20], len(ps),
                 task_data.get("repo", "?"),
                 (task_data.get("base_commit", "") or "")[:12] or "HEAD")
 
-    # Run agent in thread pool so asyncio.run() inside works correctly
+    # Run agent in thread so asyncio.run() inside works correctly
     loop   = asyncio.get_event_loop()
     action = await loop.run_in_executor(None, agent.respond, task_data)
 
-    artifact_text = (
-        action.get("content", "")
-        if action.get("action") == "patch"
-        else json.dumps(action)
-    )
+    # Return bash action as JSON, patch as raw diff
+    if action.get("action") == "patch":
+        artifact_text = action.get("content", "")
+    else:
+        # bash action — green agent reads this as JSON
+        artifact_text = json.dumps(action)
 
-    logger.info("Response: action=%s len=%d",
+    logger.info("Response: action=%s  len=%d",
                 action.get("action"), len(artifact_text))
 
     return JSONResponse(content={
@@ -853,6 +981,16 @@ async def handle_task(request: Request):
 # ==============================================================================
 
 def _extract_task_and_context(body: dict) -> tuple[dict, str]:
+    """
+    Parse A2A JSON-RPC envelope from green agent.
+
+    Turn 1 (task delivery):
+      params.message.parts[0].text = JSON with problem_statement, repo, etc.
+
+    Turn 2+ (observation):
+      params.message.parts[0].text = JSON with stdout, stderr, cwd
+      contextId is the SAME as turn 1 — used as session key
+    """
     context_id = ""
 
     if "problem_statement" in body:
@@ -881,12 +1019,13 @@ def _extract_task_and_context(body: dict) -> tuple[dict, str]:
             if kind == "text" and text.strip():
                 try:
                     parsed = json.loads(text)
-                    if isinstance(parsed, dict) and "problem_statement" in parsed:
-                        return parsed, context_id
-                    if isinstance(parsed, dict) and any(
-                        k in parsed for k in ("stdout", "stderr", "cwd", "repo", "instance_id")
-                    ):
-                        return parsed, context_id
+                    if isinstance(parsed, dict):
+                        if "problem_statement" in parsed:
+                            return parsed, context_id
+                        # Observation turn: stdout/stderr/cwd
+                        if any(k in parsed for k in
+                               ("stdout", "stderr", "cwd", "repo", "instance_id")):
+                            return parsed, context_id
                 except (json.JSONDecodeError, ValueError):
                     pass
                 return {"problem_statement": text.strip()}, context_id
