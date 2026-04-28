@@ -70,6 +70,7 @@ API_KEY       = (
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
 MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "3"))
+MCTS_ITERATIONS = int(os.getenv("MCTS_ITERATIONS", "3"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
 
 CHAT_URL = (
@@ -1059,10 +1060,6 @@ class PurpleAgent:
         logger.info("[%s] Hypotheses ready: %d", sid, len(hypotheses))
 
     # ── Stage 2: MCTS Repair ──────────────────────────────────────────────────
-
-    MCTS_ITERATIONS = 3   # rounds of refinement (total calls = branches × iterations)
-                       # = 3 × 2 = 6 LLM calls, well within 300s with DeepSeek
-
     async def _mcts_repair(self, session):
         task = session["task"]
         hypotheses = session.get("hypotheses") or []
