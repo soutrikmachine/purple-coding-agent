@@ -8,13 +8,7 @@ STAGE 1 — LLM LOCALIZATION (Turn 1, via GitHub API)
   - LLM reasons: "which files need changing?"
   - Returns bash action to explore those files in the real repo
 
-STAGE 2 — BASH EXPLORATION (Turns 2 to MAX_TURNS-1)
-  - Each turn: receive stdout/stderr from green agent's shell
-  - LLM decides next bash command based on accumulated context
-  - Builds a rich understanding of actual code state
-  - Commands: cat, grep, find, python -m pytest, git log, etc.
-
-STAGE 3 — MCTS REPAIR (Final turn)
+STAGE 2 — MCTS REPAIR (Final turn)
   - 3 parallel patch branches using all exploration context
   - PRM selects the highest-scoring valid diff
   - Returns patch
@@ -71,7 +65,6 @@ API_KEY       = (
 )
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 PORT          = int(os.getenv("PORT", "9010"))
-MAX_TURNS     = int(os.getenv("MAX_TURNS", "6"))   # turns 1-5 bash, turn 6 patch
 MCTS_BRANCHES = int(os.getenv("MCTS_BRANCHES", "3"))
 USE_MCTS      = os.getenv("USE_MCTS", "true").lower() == "true"
 
@@ -86,8 +79,7 @@ logger.info("Purple Agent  model=%s", MODEL_NAME)
 logger.info("Chat URL      %s", CHAT_URL)
 logger.info("API Key       %s", "SET ✓" if API_KEY else "MISSING ✗")
 logger.info("GitHub Token  %s", "SET ✓" if GITHUB_TOKEN else "NOT SET")
-logger.info("Multi-turn    MAX_TURNS=%d  MCTS_BRANCHES=%d",
-            MAX_TURNS, MCTS_BRANCHES)
+logger.info("pipeline      MCTS_BRANCHES=%d", MCTS_BRANCHES)
 logger.info("=" * 60)
 
 
@@ -377,7 +369,7 @@ class LLMClient:
         self,
         messages: list[dict],
         temperature: float = 0.4,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
     ) -> str:
         payload: dict[str, Any] = {
             "model":       MODEL_NAME,
@@ -458,62 +450,6 @@ PATCH RULES (when action=patch):
 - Include exactly 3 unchanged context lines before/after each change
 - No markdown fences, no explanation — raw diff only
 """
-
-
-def _build_explore_messages(
-    task: SWETask,
-    history: list[Observation],
-    located_paths: list[str],
-    turn: int,
-    max_turns: int,
-) -> list[dict]:
-    """Build the conversation history for the exploration LLM."""
-
-    located_hint = ""
-    if located_paths:
-        located_hint = (
-            "\n\nFiles most likely needing changes (from static analysis):\n"
-            + "\n".join(f"  {p}" for p in located_paths)
-        )
-
-    turns_left = max_turns - turn
-    urgency = (
-        f"\n\n⚠️  {turns_left} turn(s) remaining. "
-        + ("Switch to <action>patch</action> NOW." if turns_left <= 1
-           else "Gather the minimum info needed, then patch.")
-    )
-
-    # First user message: the bug report
-    first_user = (
-        f"Repository: {task.repo}  (commit: {task.base_commit or 'HEAD'})\n\n"
-        f"## Bug Report\n\n{task.problem_statement[:2500]}"
-        f"{located_hint}{urgency}"
-    )
-
-    messages: list[dict] = [
-        {"role": "system", "content": _EXPLORE_SYSTEM},
-        {"role": "user",   "content": first_user},
-    ]
-
-    # Replay full conversation history
-    for obs in history:
-        # Assistant sent a bash command
-        messages.append({
-            "role":    "assistant",
-            "content": (
-                f"<thought>Exploring...</thought>\n"
-                f"<action>bash</action>\n"
-                f"<content>{obs.command}</content>"
-            ),
-        })
-        # User (green agent) returned output
-        messages.append({
-            "role":    "user",
-            "content": obs.render() + "\n\nWhat is your next action?",
-        })
-
-    return messages
-
 
 def _build_repair_messages(
     task: SWETask,
@@ -670,7 +606,6 @@ class PurpleAgent:
         session = {
             "id":             session_id,
             "task":           task,
-            "turn":           0,
             "history":        [],           # list[Observation]
             "last_command":   "",           # last bash command sent
             "located_paths":  None,         # set after Stage 1
@@ -702,33 +637,19 @@ class PurpleAgent:
     async def _step(self, session: dict) -> dict:
         """Decide and return the next action for this turn."""
         session["turn"] += 1
-        turn  = session["turn"]
         task  = session["task"]
 
-        logger.info("[%s] Turn %d/%d", session["id"][:20], turn, MAX_TURNS)
+        logger.info("[%s] Running pipeline", session["id"][:20])
 
         # ── Stage 1: Localization on first turn ───────────────────────────────
         if session["located_paths"] is None:
             await self._run_localization(session)
 
-        # ── Stage 3: Final turn — MCTS patch generation ───────────────────────
-        if turn >= MAX_TURNS:
-            logger.info("[%s] Final turn — running MCTS repair", session["id"][:20])
-            patch = await self._mcts_repair(session)
-            return {"action": "patch", "content": patch}
-
-        # ── Stage 2: Bash exploration ─────────────────────────────────────────
-        bash_cmd = await self._decide_bash(session)
-
-        # If LLM already decided to patch early (it has enough info)
-        if bash_cmd is None:
-            logger.info("[%s] LLM chose to patch early", session["id"][:20])
-            patch = await self._mcts_repair(session)
-            return {"action": "patch", "content": patch}
-
-        session["last_command"] = bash_cmd
-        logger.info("[%s] bash → %s", session["id"][:20], bash_cmd[:120])
-        return {"action": "bash", "content": bash_cmd}
+        # Stage 2: MCTS repair — always return patch, green agent is single-turn
+        # (bash exploration requires Docker socket which we don't have)
+        logger.info("[%s] Running MCTS repair", session["id"][:20])
+        patch = await self._mcts_repair(session)
+        return {"action": "patch", "content": patch}
 
     # ── Stage 1: LLM Localization ─────────────────────────────────────────────
 
@@ -763,59 +684,6 @@ class PurpleAgent:
             session["located_paths"] = []
             logger.warning("[%s] Tree fetch failed", session["id"][:20])
 
-    # ── Stage 2: Bash Exploration ─────────────────────────────────────────────
-
-    async def _decide_bash(self, session: dict) -> str | None:
-        """
-        Ask the LLM what bash command to run next.
-        Returns None if the LLM wants to switch to patching.
-        """
-        msgs = _build_explore_messages(
-            session["task"],
-            session["history"],
-            session["located_paths"] or [],
-            session["turn"],
-            MAX_TURNS,
-        )
-
-        raw = await asyncio.to_thread(
-            self.llm.complete, msgs, 0.3, 512
-        )
-        if not raw:
-            # Fallback: run a basic exploration command
-            return self._fallback_bash(session)
-
-        action, content = _parse_action(raw)
-
-        if action == "patch":
-            # LLM wants to patch — let MCTS handle it
-            return None
-
-        if not content.strip():
-            return self._fallback_bash(session)
-
-        return content.strip()
-
-    def _fallback_bash(self, session: dict) -> str:
-        """Return a sensible exploration command when LLM gives no output."""
-        task     = session["task"]
-        turn     = session["turn"]
-        located  = session.get("located_paths") or []
-        history  = session["history"]
-
-        if turn == 1 and located:
-            # First turn: read the first located file
-            return f"cat -n {located[0]} | head -100"
-        elif turn == 2:
-            # Second turn: search for keywords from problem statement
-            keywords = re.findall(r'\b[A-Z][a-zA-Z]{4,}\b', task.problem_statement)[:3]
-            if keywords:
-                return f"grep -rn '{keywords[0]}' --include='*.py' --include='*.go' . | head -30"
-            return "find . -name '*.py' -o -name '*.go' | head -30"
-        elif len(history) == 0:
-            return "ls -la"
-        else:
-            return "find . -name '*.py' | xargs grep -l 'error\\|Error' | head -10"
 
     # ── Stage 3: MCTS Repair ──────────────────────────────────────────────────
 
