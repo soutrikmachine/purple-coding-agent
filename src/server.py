@@ -635,8 +635,7 @@ class PurpleAgent:
     # ── Main Step Logic ───────────────────────────────────────────────────────
 
     async def _step(self, session: dict) -> dict:
-        """Decide and return the next action for this turn."""
-        session["turn"] += 1
+        """Single-turn: localize → fetch → MCTS repair → return patch."""
         task  = session["task"]
 
         logger.info("[%s] Running pipeline", session["id"][:20])
