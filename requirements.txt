@@ -6,3 +6,4 @@ httpx==0.26.0
 python-multipart==0.0.9
 requests
 huggingface-hub
+docker==7.1.0
