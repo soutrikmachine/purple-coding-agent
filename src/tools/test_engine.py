@@ -1,119 +1,90 @@
-import logging
-import re
-from typing import List, Dict, Set, Tuple
+"""
+Note: This module acts as the Mechanical Test Gate.
+In Phase 2, we don't guess if a patch works using a PRM; 
+we run the tests inside the DockerBridge and compare 
+current failures against the baseline.
+"""
 
-logger = logging.getLogger("purple_agent.test_engine")
+import re
+import logging
+from typing import Set, Tuple, List
+from ..core.docker_bridge import DockerBridge
+
+logger = logging.getLogger(__name__)
 
 class TestEngine:
-    """
-    Handles test discovery, baseline capture (Stage 2), and the mechanical 
-    test gate verification (Stage 5) for the agent loop.
-    """
-
-    def __init__(self, docker_bridge):
-        self.bridge = docker_bridge
+    def __init__(self, docker_bridge: DockerBridge):
+        self.docker = docker_bridge
         self.baseline_failures: Set[str] = set()
-        self.test_command: str = ""
+        self.test_framework = "pytest" # Default fallback
 
-    def discover_and_capture_baseline(self) -> Tuple[bool, str]:
-        """
-        Stage 2: Discovers how to run tests, runs them, and records the baseline 
-        so the agent doesn't chase pre-existing broken tests.
-        """
-        logger.info("Stage 2: Discovering test command and capturing baseline...")
+    def _parse_failures(self, output: str) -> Set[str]:
+        """Extracts unique test IDs from logs to compute set differences."""
+        failures = set()
         
-        # 1. Heuristic Discovery (We can expand this list based on domain)
-        # Often SWE-bench supplies a test patch, but we need a command to trigger it.
-        probes = [
-            ("pytest", "python -m pytest --tb=short"),
-            ("manage.py", "python manage.py test"),
-            ("package.json", "npm test"),
-            ("go.mod", "go test ./..."),
-            ("Cargo.toml", "cargo test")
-        ]
+        # Pytest pattern: FAIL tests/test_file.py::test_func
+        pytest_pattern = r'(?:FAIL|ERROR)\s+(tests/.*|.*?\.py)::(\w+)'
+        for match in re.findall(pytest_pattern, output):
+            failures.add(f"{match[0]}::{match[1]}")
+        
+        # Unittest/Django pattern: FAIL: test_func (tests.test_file.TestCase)
+        unit_pattern = r'(?:FAIL|ERROR):\s+(\w+)\s+\((.*?)\)'
+        for match in re.findall(unit_pattern, output):
+            failures.add(f"{match[1]}.{match[0]}")
+            
+        return failures
 
-        # Check which ecosystem files exist
-        for marker, cmd in probes:
-            exit_code, _ = self.bridge.execute_bash(f"test -f {marker}")
-            if exit_code == 0:
-                self.test_command = cmd
-                break
+    def discover_and_run_baseline(self) -> List[str]:
+        """Stage 2: Runs tests BEFORE the agent makes changes."""
+        logger.info("Discovering test framework and running baseline...")
         
-        # Default fallback for Python if nothing explicitly matches
-        if not self.test_command:
-            logger.warning("No explicit test marker found. Defaulting to pytest.")
-            self.test_command = "python -m pytest --tb=short"
+        # Framework detection
+        exit_code, ls_out = self.docker.execute_command("ls -a")
+        if "manage.py" in ls_out:
+            self.test_framework = "django"
+            cmd = "python manage.py test --noinput"
+        elif "tox.ini" in ls_out:
+            self.test_framework = "tox"
+            cmd = "tox -e py39" # Common default, can be dynamically parsed
+        else:
+            self.test_framework = "pytest"
+            cmd = "pytest -x --tb=short"
 
-        # 2. Run the baseline
-        logger.info(f"Running baseline tests with command: {self.test_command}")
-        exit_code, output = self.bridge.execute_bash(self.test_command, timeout=180)
+        logger.info(f"Detected framework: {self.test_framework}. Running: {cmd}")
+        exit_code, output = self.docker.execute_command(cmd, timeout=300)
         
-        stdout = output.get("stdout", "")
+        self.baseline_failures = self._parse_failures(output)
+        logger.info(f"Baseline established. Found {len(self.baseline_failures)} pre-existing failing tests.")
         
-        # 3. Parse baseline failures
-        self.baseline_failures = set(self._parse_failures(stdout))
-        
-        logger.info(f"Baseline captured. Found {len(self.baseline_failures)} pre-existing failures.")
-        return True, stdout
+        return list(self.baseline_failures)
 
-    def run_smart_gate(self, specific_test: str = None) -> Tuple[bool, str, List[str]]:
-        """
-        Stage 5: The Mechanical Test Gate.
-        Runs the tests and compares the new failures against the baseline.
+    def run_test_gate(self) -> Tuple[bool, str]:
+        """Stage 5: Evaluates the patch by comparing current failures to baseline."""
+        if self.test_framework == "django":
+            cmd = "python manage.py test --noinput"
+        elif self.test_framework == "tox":
+            cmd = "tox"
+        else:
+            cmd = "pytest --tb=short"
+            
+        exit_code, output = self.docker.execute_command(cmd, timeout=300)
         
-        Args:
-            specific_test: If provided, runs ONLY this test (e.g., 'pytest path/to/test.py::test_name')
-                           This is the "Smarter test gate" for fast feedback.
-                           
-        Returns:
-            (passed_gate, raw_output, new_failures_list)
-        """
-        cmd = specific_test if specific_test else self.test_command
-        logger.info(f"Stage 5: Running Test Gate -> {cmd}")
-        
-        exit_code, output = self.bridge.execute_bash(cmd, timeout=180)
-        stdout = output.get("stdout", "")
-        
-        # If exit code is 0, tests passed cleanly!
         if exit_code == 0:
-            return True, stdout, []
-
-        # Parse current failures
-        current_failures = self._parse_failures(stdout)
+            return True, "All tests passed successfully."
+            
+        current_failures = self._parse_failures(output)
         
-        # Filter out baseline failures
-        new_failures = [f for f in current_failures if f not in self.baseline_failures]
+        # Isolate new regressions caused by the agent's patch
+        new_failures = current_failures - self.baseline_failures
+        fixed_failures = self.baseline_failures - current_failures
         
-        # If there are failures, but they were ALL in the baseline, the patch didn't break 
-        # anything new, and might have fixed the target bug (though ideally the target bug 
-        # transitions from baseline-fail to pass).
-        # For SWE-bench, usually we are looking for a transition of the *target* test.
-        if not new_failures:
-            logger.info("Test run failed, but NO NEW failures introduced beyond baseline.")
-            # Depending on strictness, you might consider this a pass if the target bug is fixed.
-            # For now, we return the raw output so the LLM can decide.
-            return False, stdout, new_failures
-
-        logger.warning(f"Test Gate FAILED. Introduced {len(new_failures)} new failures.")
-        return False, stdout, new_failures
-
-    def _parse_failures(self, stdout: str) -> List[str]:
-        """
-        Lightweight parser to extract failing test IDs. 
-        Currently tuned for Pytest, which is 90% of SWE-bench.
-        """
-        failures = []
+        if not new_failures and len(fixed_failures) > 0:
+            return True, f"Agent fixed tests: {list(fixed_failures)}. No new regressions."
+            
+        if not new_failures and len(current_failures) <= len(self.baseline_failures):
+            return True, "Failures detected, but they match the baseline. Ignoring."
+            
+        failure_report = "\n".join(list(new_failures))
+        trunc_output = output[-2000:] if len(output) > 2000 else output
         
-        # Look for Pytest failure lines: "FAILED path/to/test.py::test_function"
-        # or "ERROR path/to/test.py"
-        for line in stdout.splitlines():
-            line = line.strip()
-            if line.startswith("FAILED ") or line.startswith("ERROR "):
-                # Extract the test path/name
-                parts = line.split(" ", 1)
-                if len(parts) > 1:
-                    # Clean up trailing info like "- AssertionError: ..."
-                    test_id = parts[1].split(" - ")[0].strip()
-                    failures.append(test_id)
-                    
-        return list(set(failures))
+        return False, f"NEW regressions detected:\n{failure_report}\n\nLogs:\n{trunc_output}"

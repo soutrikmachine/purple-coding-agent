@@ -1,135 +1,90 @@
-import logging
-import shlex
-from typing import Dict, Tuple
+"""
+Note: This module manages the sibling Docker containers.
+By mounting /var/run/docker.sock, the Purple Agent can spawn 
+isolated environments for any SWE-bench instance, allowing us 
+to generate our own failure logs since the evaluator withholds them.
+"""
 
 import docker
-from docker.errors import DockerException, ImageNotFound
+import logging
+import time
+from typing import Tuple, Optional
 
-logger = logging.getLogger("purple_agent.docker_bridge")
+logger = logging.getLogger(__name__)
 
 class DockerBridge:
     """
-    Manages the sibling Docker container via the mounted /var/run/docker.sock.
-    This acts as the execution engine for the LLM's Bash actions and the Test Gate.
+    Manages the sibling Docker containers.
+    Mounts /var/run/docker.sock to spawn isolated environments for SWE-bench instances.
     """
-
-    def __init__(self, workdir: str = "/workspace/repo"):
-        """
-        Initializes the bridge. Relies on the host's Docker socket being mounted.
-        """
-        self.workdir = workdir
-        self.container = None
-        
+    def __init__(self, image_name: str, container_name: Optional[str] = None):
         try:
-            # Automatically connects to /var/run/docker.sock
             self.client = docker.from_env()
-        except DockerException as e:
-            logger.error("Failed to connect to Docker daemon. Is the socket mounted?")
-            raise e
+        except Exception as e:
+            logger.error(f"Failed to connect to Docker socket: {e}")
+            raise
+            
+        self.image_name = image_name
+        self.container_name = container_name or f"purple-exec-{int(time.time())}"
+        self.container = None
 
-    def bootstrap(self, image_name: str, base_commit: str = "") -> bool:
-        """
-        Stage 1: Pulls the image, starts the sibling container, and checks out the commit.
-        """
-        logger.info(f"Bootstrapping container from image: {image_name}")
-        
+    def start_container(self) -> bool:
+        logger.info(f"Starting container: {self.container_name} from {self.image_name}")
         try:
-            # 1. Ensure image exists locally
-            try:
-                self.client.images.get(image_name)
-            except ImageNotFound:
-                logger.info(f"Image {image_name} not found locally. Pulling (this may take a while)...")
-                self.client.images.pull(image_name)
-
-            # 2. Start container in detached mode, keeping it alive
             self.container = self.client.containers.run(
-                image_name,
-                command="tail -f /dev/null",
+                self.image_name,
+                name=self.container_name,
                 detach=True,
-                auto_remove=True,  # Automatically cleans up when stopped
-                working_dir=self.workdir,
-                # Give the container some memory/CPU limits if needed, but defaults are usually fine for SWE-bench
+                tty=True,
+                stdin_open=True,
+                working_dir="/workspace",
+                mem_limit="4g",
+                network_mode="bridge"
             )
-            logger.info(f"Container started: {self.container.short_id}")
-
-            # 3. Checkout the base commit if provided
-            if base_commit:
-                logger.info(f"Checking out base commit: {base_commit[:12]}")
-                exit_code, output = self.execute_bash(f"git checkout {base_commit}", timeout=60)
-                
-                if exit_code != 0:
-                    logger.error(f"Git checkout failed: {output.get('stderr')}")
-                    return False
-
             return True
-
         except Exception as e:
-            logger.exception(f"Bootstrap failed: {e}")
-            self.cleanup()
+            logger.error(f"Container startup failed: {e}")
             return False
 
-    def execute_bash(self, command: str, timeout: int = 120) -> Tuple[int, Dict[str, str]]:
-        """
-        Executes a command inside the running container safely.
-        Returns: (exit_code, {"stdout": string, "stderr": string})
-        """
+    def execute_command(self, command: str, timeout: int = 60) -> Tuple[int, str]:
         if not self.container:
-            logger.error("Attempted to execute bash, but no container is running.")
-            return -1, {"stdout": "", "stderr": "[ERROR] Container not initialized."}
+            return 1, "Error: Container not started."
 
-        # Wrap the command using GNU timeout. 
-        # This prevents the LLM from running blocking commands (e.g., starting a server without `&`)
-        # and hanging the entire pipeline.
-        safe_command = f"timeout {timeout} bash -c {shlex.quote(command)}"
-        
-        logger.debug(f"Executing: {command}")
+        # Shell-level timeout to prevent infinite loops (e.g., hanging grep)
+        safe_command = f"timeout {timeout}s bash -c {docker.utils.quote_executable(command)}"
         
         try:
-            # demux=True guarantees stdout and stderr are returned as separate streams
-            exit_code, streams = self.container.exec_run(
-                safe_command,
-                workdir=self.workdir,
-                demux=True 
+            # demux=True ensures STDOUT and STDERR are cleanly separated
+            exit_code, output = self.container.exec_run(
+                cmd=["bash", "-c", command],
+                demux=True
             )
             
-            # Docker returns None for a stream if it's empty
-            stdout_bytes = streams[0] if streams and streams[0] else b""
-            stderr_bytes = streams[1] if streams and streams[1] else b""
+            stdout, stderr = output
+            combined_output = ""
+            if stdout:
+                combined_output += stdout.decode('utf-8', errors='replace')
+            if stderr:
+                combined_output += f"\nSTDERR:\n{stderr.decode('utf-8', errors='replace')}"
+                
+            return exit_code, combined_output.strip()
             
-            stdout = stdout_bytes.decode("utf-8", errors="replace")
-            stderr = stderr_bytes.decode("utf-8", errors="replace")
-
-            # GNU timeout returns 124 if the command actually timed out
-            if exit_code == 124:
-                stderr = f"[ERROR] Command timed out after {timeout} seconds.\n" + stderr
-
-            return exit_code, {"stdout": stdout, "stderr": stderr}
-
         except Exception as e:
-            logger.exception(f"Execution error on command: {command}")
-            return -1, {"stdout": "", "stderr": f"[INTERNAL ERROR] {str(e)}"}
+            logger.error(f"Command execution failed: {e}")
+            return 1, str(e)
 
-    def write_file(self, filepath: str, content: str) -> bool:
-        """
-        Helper method specifically for injecting tools or patches (like ast_graph.py).
-        """
-        escaped_content = shlex.quote(content)
-        exit_code, output = self.execute_bash(f"cat << 'EOF' > {filepath}\n{content}\nEOF")
-        if exit_code != 0:
-            logger.error(f"Failed to write file {filepath}: {output['stderr']}")
-            return False
-        return True
-
-    def cleanup(self):
-        """
-        Stops the container. Since `auto_remove=True` is set, Docker will also delete it.
-        """
+    def stop_container(self):
         if self.container:
-            logger.info(f"Cleaning up container {self.container.short_id}...")
+            logger.info(f"Stopping and removing container: {self.container_name}")
             try:
-                # Fast timeout to forcefully kill it quickly
-                self.container.stop(timeout=2) 
+                self.container.stop()
+                self.container.remove()
             except Exception as e:
-                logger.warning(f"Error stopping container: {e}")
-            finally:
-                self.container = None
+                logger.warning(f"Cleanup failed: {e}")
+
+    def __del__(self):
+        if hasattr(self, 'container') and self.container:
+            try:
+                self.container.remove(force=True)
+            except:
+                pass
