@@ -1,32 +1,7 @@
 {
-  "manifest_version": "0.1.0",
-  "program": {
-    "image": "rimodock/purple-coding-agent:latest",
-    "entrypoint": "uvicorn src.server:app --host 0.0.0.0 --port 9010",
-    "mounts": [
-      {
-        "type": "bind",
-        "source": "/var/run/docker.sock",
-        "target": "/var/run/docker.sock",
-        "description": "Required for Docker-out-of-Docker execution-based verification."
-      }
-    ],
-    "network": {
-      "endpoints": [
-        {
-          "name": "a2a",
-          "port": 9010
-        }
-      ]
-    },
-    "env": {
-      "LLM_BASE_URL": "https://openrouter.ai/api/v1",
-      "MODEL_NAME": "deepseek/deepseek-v4-flash",
-      "OPENROUTER_API_KEY": "${config.openrouter_key}",
-      "GITHUB_TOKEN": "${config.github_token}",
-      "MAX_TURNS": "50"
-    }
-  },
+  "manifest_version": "0.3.0",
+  "experimental_features": ["docker"],
+
   "config_schema": {
     "type": "object",
     "properties": {
@@ -40,14 +15,46 @@
         "title": "GitHub Token",
         "secret": true
       }
+    },
+    "required": ["openrouter_key"]
+  },
+
+  "program": {
+    "image": "rimodock/purple-coding-agent:latest",
+    "entrypoint": "uvicorn src.server:app --host 0.0.0.0 --port 9010",
+
+    "mounts": [
+      { 
+        "path": "/var/run/docker.sock", 
+        "from": "framework.docker" 
+      }
+    ],
+
+    "env": {
+      "OPENROUTER_API_KEY": "${config.openrouter_key}",
+      "GITHUB_TOKEN": "${config.github_token}",
+      "LLM_BASE_URL": "https://openrouter.ai/api/v1",
+      "MODEL_NAME": "deepseek/deepseek-v4-flash",
+      "MAX_TURNS": "50"
+    },
+
+    "network": {
+      "endpoints": [
+        { 
+          "name": "a2a_endpoint", 
+          "port": 9010 
+        }
+      ]
     }
   },
+
   "provides": {
-    "a2a": {
-      "kind": "a2a",
-      "endpoint": "a2a"
+    "a2a": { 
+      "kind": "a2a", 
+      "endpoint": "a2a_endpoint" 
     }
   },
+
   "exports": {
     "a2a": "a2a"
   }
