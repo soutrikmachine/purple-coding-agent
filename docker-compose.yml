@@ -1,42 +1,49 @@
 version: "3.9"
 
 services:
+  # ── Purple Agent: Phase 2 Execution Engine ──────────────────────────────────
   purple-agent:
     build: .
+    image: purple-agent:latest
+    container_name: purple-agent-server
     ports:
       - "9010:9010"
     environment:
-      - LLM_BASE_URL=http://vllm:8000
+      # Secrets and LLM Configuration
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - LLM_BASE_URL=https://openrouter.ai/api/v1
       - MODEL_NAME=deepseek/deepseek-v4-flash
-      - MAX_TURNS=15
-      - MCTS_BRANCHES=3
-      - TEMPERATURE=0.6
-      - USE_MCTS=true
-    depends_on:
-      vllm:
-        condition: service_healthy
+      
+      # Agent Loop Configuration
+      - PORT=9010
+      - MAX_TURNS=50
+      - LOG_LEVEL=INFO
+    volumes:
+      # CRITICAL: Enables sibling container spawning for test execution
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
-      - agent-net
+      - purple-net
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9010/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
+  # ── Local vLLM (Optional Profile for GPU hosts) ───────────────────────────
+  # Run with: docker-compose --profile local-llm up
   vllm:
+    profiles: ["local-llm"]
     image: vllm/vllm-openai:latest
     ports:
       - "8000:8000"
     environment:
-      - OPENROUTER_HUB_TOKEN=${OPENROUTER_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN}
     command: >
-      --model deepseek/deepseek-v4-flash
-      --dtype bfloat16
-      --max-model-len 8192
-      --gpu-memory-utilization 0.85
-      --quantization bitsandbytes
-      --trust-remote-code
-      --port 8000
+      --model deepseek-ai/DeepSeek-V3
+      --tensor-parallel-size 1
+      --max-model-len 32768
+      --gpu-memory-utilization 0.90
     deploy:
       resources:
         reservations:
@@ -44,20 +51,9 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    volumes:
-      - hf_cache:/root/.cache/huggingface
     networks:
-      - agent-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 120s
+      - purple-net
 
 networks:
-  agent-net:
+  purple-net:
     driver: bridge
-
-volumes:
-  hf_cache:

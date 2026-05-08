@@ -1,5 +1,6 @@
 import logging
-from typing import Dict, List
+import asyncio
+from typing import Dict, List, Tuple, Optional
 from .llm_client import LLMClient
 from .docker_bridge import DockerBridge
 from ..tools.test_engine import TestEngine
@@ -7,98 +8,188 @@ from ..tools.test_engine import TestEngine
 logger = logging.getLogger(__name__)
 
 class AgentLoop:
-    """Orchestrates the stateful execution engine and QA micro-loops."""
+    """
+    The core stateful execution engine for the Purple Agent.
+    Orchestrates Stage 4 (50-turn Bash REPL) and Stage 6 (QA Fix Phase).
+    
+    The ICLSpecialist data is introduced here as the 'context_primer' to anchor 
+    the model's behavior across long-running asynchronous turns.
+    """
     def __init__(self, llm_client: LLMClient, docker_bridge: DockerBridge, test_engine: TestEngine):
         self.llm = llm_client
         self.docker = docker_bridge
         self.test_engine = test_engine
         self.max_turns = 50
         
-        self.system_prompt = (
-            "You are an autonomous software engineering agent running in a stateful bash environment.\n"
-            "Your task is to resolve the provided GitHub issue.\n"
-            "You have full root access to a Docker container with the repository mounted at /workspace.\n"
-            "You must use the following XML tags for every turn:\n"
-            "<thought>Explain your reasoning here.</thought>\n"
-            "<action type=\"bash\">Your bash command here</action>\n\n"
-            "Special Actions:\n"
-            "- <action type=\"submit\">Done</action> : Use this when you have written the fix and are ready to test."
-        )
+        # Base system instructions that never change across turns
+        self.system_prompt = textwrap.dedent("""\
+            You are Purple Agent, an expert software engineer operating autonomously.
+            You are running inside a stateful Bash REPL in a Docker container with the target repository mounted at /workspace.
+            
+            Your objective is to solve the provided GitHub issue correctly and efficiently within a strict limit of 50 shell calls.
+            Because compute resources are constrained, you must solve the problem using as few calls as possible. A top-tier solution requires 8-12 calls.
+
+            <protocol>
+            You MUST respond using this exact XML structure for every turn:
+            <thought>
+            Step-by-step reasoning. Analyze the problem, plan your batch reads/edits, and verify your logic against edge cases.
+            </thought>
+            <action type="bash">
+            Your single-line bash command or chained commands here.
+            </action>
+            
+            When you have fully verified your fix passes the tests, terminate the loop with:
+            <action type="submit">Done</action>
+            </protocol>
+
+            <efficiency_and_editing>
+            Minimize calls by batching your work. 
+            Do NOT rely on brittle `sed` commands for multi-line edits. Instead, use Python heredocs to read, replace, and write reliably.
+
+            Batched read example (1 call, multiple files):
+              cat -n src/user/email.py | head -n 80 && echo '===FILE2===' && grep -rn 'def send' src/
+
+            Batched edit + verify example (1 call, robust replacement):
+              python -c "
+            import pathlib
+            f = pathlib.Path('src/api/users.py')
+            content = f.read_text()
+            new_content = content.replace('if not user:', 'if not user or not user.is_active:')
+            f.write_text(new_content)
+            " && grep -n 'is_active' src/api/users.py
+
+            RULES FOR EDITING:
+            1. The old string in `.replace()` must match EXACTLY, or it silently fails.
+            2. ALWAYS chain a `grep` or `diff` immediately after your edit to verify it landed.
+            3. Make MINIMAL changes. Change only the lines needed. Do not rewrite whole functions.
+            </efficiency_and_editing>
+
+            <rigorous_grading>
+            After you submit, your patch will face a strict Mechanical Test Gate. 
+            Code must be safety-critical. Every modified or new function MUST handle:
+            - null, undefined, or None values
+            - empty arrays/lists/dicts
+            - missing object keys
+            - boundary conditions (0, -1, max limits)
+            
+            Prioritize core requirements and robust edge-case handling. Ignore cosmetic improvements or peripheral linting.
+            </rigorous_grading>
+
+            <self_test_before_submit>
+            Before you issue <action type="submit">, you must look past the obvious symptom:
+            1. Run the local test suite (e.g., `pytest tests/path_to_test.py -x --tb=short`).
+            2. If tests are too slow, write a quick sanity check (`python -c "import module; module.test_func()"`) to verify your fix.
+            3. Does your fix handle the EMPTY case? The NULL case?
+            4. Review neighboring code. Your fix must match the surrounding error-handling patterns.
+            
+            Finding and fixing failures yourself using bash is cheaper than having your patch rejected by the final QA gate.
+            </self_test_before_submit>
+        """)
 
     async def run_stage_4_bash_repl(self, issue_text: str, context_primer: str) -> Tuple[bool, List[Dict]]:
+        """
+        Executes the 50-turn stateful loop.
+        
+        The 'context_primer' contains the Stage 2.5 ICL Injection:
+        - Domain-specific rules (Django, Pytest, etc.)
+        - Few-shot examples of correct thought/action/observation loops
+        - Diagnostic hypotheses
+        """
+        # Initializing history with the ICL-enriched primer
         messages = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"Issue:\n{issue_text}\n\nContext Primer:\n{context_primer}\n\nBegin."}
+            {"role": "user", "content": (
+                f"### TARGET ISSUE\n{issue_text}\n\n"
+                f"{context_primer}\n\n"
+                "Please begin your exploration by verifying the issue."
+            )}
         ]
 
+        logger.info(f"Starting Stage 4 Bash REPL with {self.max_turns} turn limit.")
+
         for turn in range(1, self.max_turns + 1):
-            logger.info(f"--- Starting Turn {turn}/{self.max_turns} ---")
+            logger.info(f"--- TURN {turn}/{self.max_turns} ---")
             
-            raw_response = await self.llm.generate_step(messages)
-            messages.append({"role": "assistant", "content": raw_response})
-            
-            thought, action_type, action_content = self.llm.parse_response(raw_response)
-            
-            if not action_type:
-                logger.warning("No action detected. Prompting agent to correct format.")
-                messages.append({
-                    "role": "user", 
-                    "content": "<observation status=\"FAILED\">Error: No valid <action> tag found. Please ensure you output <action type=\"bash\">...</action>.</observation>"
-                })
-                continue
-
-            if action_type == "submit":
-                logger.info("Agent submitted the patch. Exiting Stage 4 REPL.")
-                return True, messages
-                
-            if action_type == "bash":
-                logger.info(f"Executing: {action_content}")
-                exit_code, output = self.docker.execute_command(action_content)
-                observation = self.llm.format_observation(output, exit_code)
-                messages.append({"role": "user", "content": observation})
-            else:
-                messages.append({
-                    "role": "user", 
-                    "content": f"<observation status=\"FAILED\">Error: Unknown action type '{action_type}'. Only 'bash' and 'submit' are supported.</observation>"
-                })
-
-        logger.warning("Max turns reached without submission.")
-        return False, messages
-
-    async def run_stage_6_qa_phase(self, messages: List[Dict[str, str]], max_qa_retries: int = 3) -> bool:
-        retries = 0
-        while retries < max_qa_retries:
-            logger.info(f"--- QA Phase: Attempt {retries + 1}/{max_qa_retries} ---")
-            
-            test_passed, test_logs = self.test_engine.run_test_gate()
-            
-            if test_passed:
-                logger.info("QA Phase Passed. Patch is successful.")
-                return True
-                
-            logger.warning("QA Phase Failed. Injecting test logs back to agent.")
-            qa_prompt = (
-                "The test suite failed after your patch. Analyze the following logs and fix the implementation.\n\n"
-                f"<test_failures>\n{test_logs}\n</test_failures>\n\n"
-                "Provide your next <thought> and <action type=\"bash\"> to investigate or fix the issue."
-            )
-            messages.append({"role": "user", "content": qa_prompt})
-            
-            # 5-turn Micro-loop for fixing the specific test failure
-            for _ in range(5):
+            try:
+                # 1. Generate turn using DeepSeek-v4-flash via OpenRouter
                 raw_response = await self.llm.generate_step(messages)
                 messages.append({"role": "assistant", "content": raw_response})
                 
+                # 2. Parse the LLM's intent
                 thought, action_type, action_content = self.llm.parse_response(raw_response)
                 
+                if not action_type:
+                    logger.warning("Agent failed to provide an action. Requesting retry.")
+                    messages.append({
+                        "role": "user", 
+                        "content": "<observation status=\"FAILED\">Error: Missing <action> tag. Please provide a command.</observation>"
+                    })
+                    continue
+
+                # 3. Handle 'Submit' - transition to Stage 6
                 if action_type == "submit":
-                    break
+                    logger.info("Agent issued 'submit'. Terminating REPL loop.")
+                    return True, messages
                     
+                # 4. Handle 'Bash' execution inside the Sibling Container
+                if action_type == "bash":
+                    logger.info(f"Action [Bash]: {action_content}")
+                    exit_code, output = self.docker.execute_command(action_content)
+                    
+                    # 5. Inject ground-truth observation back into context
+                    observation = self.llm.format_observation(output, exit_code)
+                    messages.append({"role": "user", "content": observation})
+                else:
+                    messages.append({
+                        "role": "user", 
+                        "content": f"<observation status=\"FAILED\">Error: Unknown action '{action_type}'. Use 'bash' or 'submit'.</observation>"
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Critical error in REPL turn {turn}: {e}")
+                break
+
+        logger.warning("Agent reached maximum turns without submitting.")
+        return False, messages
+
+    async def run_stage_6_qa_phase(self, messages: List[Dict[str, str]], max_qa_retries: int = 3) -> bool:
+        """
+        Stage 6: The Mechanical Test Gate micro-loop.
+        This provides immediate feedback if the patch breaks baseline tests.
+        """
+        for attempt in range(1, max_qa_retries + 1):
+            logger.info(f"--- QA GATE ATTEMPT {attempt}/{max_qa_retries} ---")
+            
+            # Execute Smarter Gate (Stage 5 logic)
+            passed, test_logs = self.test_engine.run_test_gate()
+            
+            if passed:
+                logger.info("QA Gate Passed. Solution is viable.")
+                return True
+                
+            logger.warning(f"QA Gate Failed on attempt {attempt}. Injecting logs for repair.")
+            
+            # Anchor the correction in the existing context window
+            qa_instruction = (
+                "CRITICAL: The test gate failed. Your patch caused regressions or failed to fix the issue.\n"
+                f"### TEST FAILURE LOGS\n{test_logs}\n\n"
+                "Review the logs and provide a fix via bash commands. Submit again when resolved."
+            )
+            messages.append({"role": "user", "content": qa_instruction})
+            
+            # Allow a 5-turn 'repair burst' per QA failure
+            for sub_turn in range(5):
+                raw_response = await self.llm.generate_step(messages)
+                messages.append({"role": "assistant", "content": raw_response})
+                
+                _, action_type, action_content = self.llm.parse_response(raw_response)
+                
+                if action_type == "submit":
+                    break # Re-run the main test gate
+                
                 if action_type == "bash":
                     exit_code, output = self.docker.execute_command(action_content)
                     messages.append({"role": "user", "content": self.llm.format_observation(output, exit_code)})
-                    
-            retries += 1
 
-        logger.error("Failed to pass QA phase after maximum retries.")
+        logger.error("QA Gate failed after maximum retries. Patch rejected.")
         return False
