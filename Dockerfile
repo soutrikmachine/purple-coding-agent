@@ -39,9 +39,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 1. Install Phase 2 System Dependencies
-# - gcc & python3-dev: Mandatory for tree-sitter (Graph RAG)
-# - docker.io: Mandatory for sibling container execution
+# 1. Install System Dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gcc \
@@ -49,21 +47,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     docker.io \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Python Dependencies[cite: 1]
-# We've moved from requirements.txt to the more robust pyproject.toml
+# 2. Copy the manifest and project files
 COPY pyproject.toml .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir .
 
-# 3. Copy Application Code
+# 3. COPY THE CODE FIRST (Mandatory for Hatchling build metadata)
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 
-# Ensure utility scripts are executable
+# 4. Install Python Dependencies and the local project
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir .
+
+# 5. Ensure utility scripts are executable
 RUN chmod +x scripts/*.sh
 
-# 4. A2A Handshake Port[cite: 2]
+# 6. Boot the server
 EXPOSE 9010
-
-# 5. Boot the server using the A2A handshake logic[cite: 2]
 CMD ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "9010"]
