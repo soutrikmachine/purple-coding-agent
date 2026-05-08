@@ -7,7 +7,7 @@ services:
     image: purple-agent:latest
     container_name: purple-agent-server
     ports:
-      - "9010:9010"
+      - "9022:9022"
     environment:
       # Secrets and LLM Configuration
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -15,7 +15,7 @@ services:
       - MODEL_NAME=deepseek/deepseek-v4-flash
       
       # Agent Loop Configuration
-      - PORT=9010
+      - PORT=9022
       - MAX_TURNS=50
       - LOG_LEVEL=INFO
     volumes:
@@ -25,7 +25,7 @@ services:
       - purple-net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9010/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9022/health"]
       interval: 30s
       timeout: 10s
       retries: 3

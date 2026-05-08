@@ -3,7 +3,7 @@
 # Sends a mock A2A payload to the local server to verify the Phase 2 pipeline.
 
 # Ensure the server is running on the expected port
-PORT=${PORT:-9010}
+PORT=${PORT:-9022}
 URL="http://localhost:$PORT/"
 
 echo "🚀 Sending mock SWE-Bench task to Purple Agent at $URL..."
