@@ -45,9 +45,47 @@ class LLMClient:
             logger.error(f"LLM API call failed: {e}")
             raise
 
-    def parse_response(self, response_text: str) -> Tuple[str, Optional[str], Optional[str]]:
-        # ... (keep existing regex logic from previous step)
-        pass
+    def parse_response(self, raw_text: str) -> tuple[str, str, str]:
+        """
+        Forgiving parser that extracts <thought> and <action> tags.
+        Guarantees a return of (thought, action_type, action_content).
+        """
+        if not raw_text:
+             return (
+                 "Empty response received.", 
+                 "bash", 
+                 "echo 'System Error: Received empty response. Please provide a valid <thought> and <action>.'"
+             )
+
+        # Default fallbacks
+        thought = "No thought provided."
+        action_type = "bash"
+        action_content = "echo 'System Error: No valid <action> tag found. You MUST format your response with <action type=\"...\">...</action>. Try again.'"
+
+        # Extract thought (optional, but good for logging)
+        # re.DOTALL ensures it matches across newlines
+        thought_match = re.search(r'<thought>(.*?)</thought>', raw_text, re.DOTALL | re.IGNORECASE)
+        if thought_match:
+            thought = thought_match.group(1).strip()
+
+        # Greedy extraction for action type and content
+        # Handles optional quotes: <action type="bash"> or <action type=python>
+        action_match = re.search(r'<action\s+type=[\'"]?(.*?)[\'"]?>(.*?)</action>', raw_text, re.DOTALL | re.IGNORECASE)
+
+        if action_match:
+            action_type = action_match.group(1).strip().lower()
+            action_content = action_match.group(2).strip()
+        else:
+            # Fallback heuristic: If the LLM just dumped markdown code blocks instead of XML
+            markdown_match = re.search(r'```(bash|python|sh)\n(.*?)
+                ```', raw_text, re.DOTALL | re.IGNORECASE)
+            if markdown_match:
+                logging.warning("Extracted action from markdown block instead of XML tag.")
+                action_type = markdown_match.group(1).strip().lower()
+                if action_type == 'sh': action_type = 'bash'
+                action_content = markdown_match.group(2).strip()
+
+        return thought, action_type, action_content
 
     def format_observation(self, output: str, exit_code: int) -> str:
         status = "SUCCESS" if exit_code == 0 else f"FAILED (Exit {exit_code})"

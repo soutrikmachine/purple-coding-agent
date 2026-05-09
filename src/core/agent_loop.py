@@ -118,6 +118,14 @@ class AgentLoop:
                 
                 # 2. Parse the LLM's intent
                 thought, action_type, action_content = self.llm.parse_response(raw_response)
+
+                try:
+                    thought, action_type, action_content = self.llm.parse_response(raw_response)
+                except Exception as e:
+                    logger.error(f"Catastrophic parsing failure on turn {turn}: {e}")
+                    thought = "System recovered from parsing crash."
+                    action_type = "bash"
+                    action_content = f"echo 'System Error: Parser exception {str(e)}. You MUST use strict XML format: <action type=\"bash\">your command</action>'"
                 
                 if not action_type:
                     logger.warning("Agent failed to provide an action. Requesting retry.")
@@ -147,8 +155,12 @@ class AgentLoop:
                     })
                     
             except Exception as e:
-                logger.error(f"Critical error in REPL turn {turn}: {e}")
-                break
+                logger.error(f"Critical execution error in REPL turn {turn}: {e}")
+                # We do not break here; allow the loop to continue and potentially recover
+                messages.append({
+                    "role": "user",
+                    "content": f"<observation status=\"FAILED\">Critical internal error: {str(e)}.</observation>"
+                })
 
         logger.warning("Agent reached maximum turns without submitting.")
         return False, messages
@@ -164,7 +176,7 @@ class AgentLoop:
             # 1. Execute Smarter Gate (Stage 5 logic - Secret 6)
             # Note: Ensure your AgentLoop __init__ maps the test engine to self.tester 
             # (e.g., self.tester = tester) to match server.py
-            gate_passed, gate_msg = self.tester.verify_patch()
+            gate_passed, gate_msg = self.test_engine.verify_patch()
             
             if gate_passed:
                 logger.info("QA Gate Passed. Solution is viable and regression-free.")
@@ -188,7 +200,13 @@ class AgentLoop:
                 raw_response = await self.llm.generate_step(messages)
                 messages.append({"role": "assistant", "content": raw_response})
                 
-                _, action_type, action_content = self.llm.parse_response(raw_response)
+                # PROTECTED: Safe parsing logic mirrored for the inner repair loop
+                try:
+                    _, action_type, action_content = self.llm.parse_response(raw_response)
+                except Exception as e:
+                    logger.error(f"Catastrophic parsing failure in QA loop: {e}")
+                    action_type = "bash"
+                    action_content = f"echo 'System Error: Parser exception {str(e)}. You MUST use strict XML format: <action type=\"bash\">your command</action>'"
                 
                 if action_type == "submit":
                     break # Break inner loop to re-run the main broad test gate
