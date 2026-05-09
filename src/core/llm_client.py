@@ -77,8 +77,7 @@ class LLMClient:
             action_content = action_match.group(2).strip()
         else:
             # Fallback heuristic: If the LLM just dumped markdown code blocks instead of XML
-            markdown_match = re.search(r'```(bash|python|sh)\n(.*?)
-                ```', raw_text, re.DOTALL | re.IGNORECASE)
+            markdown_match = re.search(r'```(bash|python|sh)\n(.*?)```', raw_text, re.DOTALL | re.IGNORECASE)
             if markdown_match:
                 logging.warning("Extracted action from markdown block instead of XML tag.")
                 action_type = markdown_match.group(1).strip().lower()
