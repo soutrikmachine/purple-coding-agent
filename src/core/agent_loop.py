@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import textwrap
 from typing import Dict, List, Tuple, Optional
 from .llm_client import LLMClient
 from .docker_bridge import DockerBridge
