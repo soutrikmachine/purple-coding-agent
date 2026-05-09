@@ -6,85 +6,134 @@ to generate our own failure logs since the evaluator withholds them.
 """
 
 import docker
-import logging
+import subprocess
 import time
-from typing import Tuple, Optional
+import logging
 
 logger = logging.getLogger(__name__)
 
 class DockerBridge:
-    """
-    Manages the sibling Docker containers.
-    Mounts /var/run/docker.sock to spawn isolated environments for SWE-bench instances.
-    """
-    def __init__(self, image_name: str, container_name: Optional[str] = None):
-        try:
-            self.client = docker.from_env()
-        except Exception as e:
-            logger.error(f"Failed to connect to Docker socket: {e}")
-            raise
-            
+    """Manages DooD (Docker-out-of-Docker) execution for SWE-Bench Pro."""
+    
+    # We added base_commit here so it can be passed in from server.py
+    def __init__(self, image_name: str, base_commit: str = None, repo_dir: str = "/workspace"):
         self.image_name = image_name
-        self.container_name = container_name or f"purple-exec-{int(time.time())}"
+        self.base_commit = base_commit 
+        self.repo_dir = repo_dir
+        self.client = docker.from_env()
         self.container = None
 
     def start_container(self) -> bool:
-        logger.info(f"Starting container: {self.container_name} from {self.image_name}")
+        """Starts the sibling container, using local cache if pulling fails."""
         try:
-            self.container = self.client.containers.run(
-                self.image_name,
-                name=self.container_name,
-                detach=True,
-                tty=True,
-                stdin_open=True,
-                working_dir="/workspace",
-                mem_limit="4g",
-                network_mode="bridge"
-            )
-            return True
+            logger.info(f"Attempting to pull image: {self.image_name}")
+            self.client.images.pull(self.image_name)
         except Exception as e:
-            logger.error(f"Container startup failed: {e}")
+            try:
+                self.client.images.get(self.image_name)
+                logger.info(f"Image {self.image_name} found in local cache.")
+            except Exception as inner_e:
+                logger.error(f"Failed to find or pull image {self.image_name}: {inner_e}")
+                return False
+
+        try:
+            self.container = self.client.containers.create(
+                self.image_name,
+                detach=True,
+                entrypoint="/bin/bash",
+                command=["-c", "tail -f /dev/null"],
+                working_dir=self.repo_dir
+            )
+            self.container.start()
+            logger.info(f"Started sibling container: {self.container.short_id}")
+            
+            # SECRET 4: The Clean Slate Checkout
+            if self.base_commit:
+                checkout_cmd = f"git checkout {self.base_commit} && git reset --hard {self.base_commit}"
+                self.execute_command(checkout_cmd)
+                
+            # SECRET 7: Start background databases before the LLM takes over
+            self._start_required_services()
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Container creation failed: {e}")
             return False
 
-    def execute_command(self, command: str, timeout: int = 60) -> Tuple[int, str]:
+    def execute_command(self, command: str, timeout: int = 120) -> tuple[int, str]:
+        """
+        Executes a shell command. 
+        SECRET 3: Uses subprocess CLI to bypass the Amber proxy EOF bug.
+        """
         if not self.container:
-            return 1, "Error: Container not started."
+            return -1, "Error: Container not running."
 
-        # Shell-level timeout to prevent infinite loops (e.g., hanging grep)
-        safe_command = f"timeout {timeout}s bash -c {docker.utils.quote_executable(command)}"
-        
+        # Wrap in container-side timeout
+        docker_cmd = [
+            "docker", "exec", "-w", self.repo_dir, self.container.id,
+            "timeout", "-k", "5", f"{timeout}s",
+            "bash", "-c", command
+        ]
+
+        t0 = time.monotonic()
         try:
-            # demux=True ensures STDOUT and STDERR are cleanly separated
-            exit_code, output = self.container.exec_run(
-                cmd=["bash", "-c", command],
-                demux=True
+            # We add a 30s grace period on the host side over the container timeout
+            result = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                timeout=timeout + 30
             )
+            exit_code = result.returncode
+            stdout = result.stdout.decode(errors="replace")
+            stderr = result.stderr.decode(errors="replace")
             
-            stdout, stderr = output
-            combined_output = ""
-            if stdout:
-                combined_output += stdout.decode('utf-8', errors='replace')
-            if stderr:
-                combined_output += f"\nSTDERR:\n{stderr.decode('utf-8', errors='replace')}"
-                
-            return exit_code, combined_output.strip()
-            
-        except Exception as e:
-            logger.error(f"Command execution failed: {e}")
-            return 1, str(e)
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - t0
+            return 137, f"[Host subprocess timed out after {elapsed:.0f}s]"
+
+        combined_output = stdout
+        if stderr:
+            combined_output = combined_output + "\n" + stderr if combined_output else stderr
+
+        if exit_code in (124, 137):
+            note = f"\n[Command timed out after {timeout}s]"
+            combined_output = combined_output + note if combined_output else note.lstrip("\n")
+
+        return exit_code, combined_output
 
     def stop_container(self):
+        """Cleans up the sibling container."""
         if self.container:
-            logger.info(f"Stopping and removing container: {self.container_name}")
             try:
-                self.container.stop()
-                self.container.remove()
+                self.container.stop(timeout=5)
+                self.container.remove(force=True)
+                logger.info(f"Cleaned up container {self.container.short_id}")
             except Exception as e:
-                logger.warning(f"Cleanup failed: {e}")
+                logger.warning(f"Failed to cleanly remove container: {e}")
+            self.container = None
+
+    def _start_required_services(self):
+        """Heuristically detects and starts required databases."""
+        logger.info("Scanning for required background services...")
+        
+        # Check for Redis
+        _, out = self.execute_command("grep -qi redis package.json config.json docker-compose.y*ml 2>/dev/null && echo yes")
+        if "yes" in out:
+            self.execute_command("redis-server --daemonize yes --protected-mode no --appendonly yes")
+            logger.info("Started Redis server.")
+            
+        # Check for MongoDB
+        _, out = self.execute_command("grep -qi mongo package.json config.json docker-compose.y*ml 2>/dev/null && echo yes")
+        if "yes" in out:
+            self.execute_command("mkdir -p /data/db && mongod --fork --logpath /tmp/mongod.log --dbpath /data/db")
+            logger.info("Started MongoDB.")
+            
+        # Check for PostgreSQL
+        _, out = self.execute_command("grep -qi postgres package.json config.json docker-compose.y*ml 2>/dev/null && echo yes")
+        if "yes" in out:
+            self.execute_command("su - postgres -c 'pg_ctl start -D /var/lib/postgresql/data -l /tmp/pg.log' || pg_ctlcluster 14 main start")
+            logger.info("Started PostgreSQL.")
 
     def __del__(self):
-        if hasattr(self, 'container') and self.container:
-            try:
-                self.container.remove(force=True)
-            except:
-                pass
+        self.stop_container()

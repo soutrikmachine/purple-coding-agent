@@ -73,7 +73,6 @@ async def health():
 # ==============================================================================
 
 def _extract_task_and_context(body: dict) -> tuple[dict, str]:
-    # ... (Keep your working Phase 1 extraction logic here exactly as it was) ...
     context_id = ""
     if "problem_statement" in body:
         return body, context_id
@@ -114,13 +113,15 @@ async def handle_task(request: Request):
         
     problem_statement = task_data.get("problem_statement", "")
     repo = task_data.get("repo", "unknown/repo")
-    image_name = task_data.get("container_image", "swe-bench-instance:latest")
+    image_name = task_data.get("docker_image", "swe-bench-instance:latest")
+    base_commit = task_data.get("base_commit", "HEAD")
 
     logger.info(f"Handshake Complete: context_id={context_id[:20]} | repo={repo}")
 
     # --- Phase 2 Core Logic ---
     llm = LLMClient()
-    docker = DockerBridge(image_name=image_name)
+    # Fixed the double-initialization bug here. We only init once with all parameters.
+    docker = DockerBridge(image_name=image_name, base_commit=base_commit)
     tester = TestEngine(docker)
     hyp_gen = HypothesisGenerator(llm)
     icl = ICLSpecialist()
@@ -142,10 +143,31 @@ async def handle_task(request: Request):
         agent_loop = AgentLoop(llm, docker, tester)
         success, messages = await agent_loop.run_stage_4_bash_repl(problem_statement, context_primer)
 
+        # Stage 5 & 6: Verification and Patch Extraction
         patch_content = ""
         if success:
-            if await agent_loop.run_stage_6_qa_phase(messages):
-                _, patch_content = docker.execute_command("git diff")
+            # First, check our internal mechanical gate (Secret 6)
+            gate_passed, gate_msg = tester.verify_patch()
+            
+            # If it failed, send it to the rapid QA loop (Targeted Testing)
+            if not gate_passed:
+                logger.warning(f"Initial patch failed gate. Entering targeted QA Phase. Reason: {gate_msg}")
+                gate_passed = await agent_loop.run_stage_6_qa_phase(messages)
+
+            # Final Patch Extraction (Secret 5)
+            if gate_passed:
+                logger.info("Test Gate Passed. Extracting final patch.")
+                diff_cmd = (
+                    "git ls-files --others --exclude-standard | "
+                    "grep -v -E '(__pycache__|\\.pyc$|\\.egg-info/)' | "
+                    "xargs -r -d '\\n' git add -N -- || true && "
+                    "git diff HEAD -- ."
+                )
+                _, patch_content = docker.execute_command(diff_cmd)
+            else:
+                logger.error("QA Phase exhausted. Patch failed final test gate. Collecting diff anyway.")
+                # We extract the diff anyway just in case it scores partial points with the grader
+                _, patch_content = docker.execute_command("git diff HEAD -- .")
 
         # Returning the exact Phase 1 JSON structure you provided
         return JSONResponse(content={

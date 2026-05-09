@@ -152,32 +152,37 @@ class AgentLoop:
         logger.warning("Agent reached maximum turns without submitting.")
         return False, messages
 
-    async def run_stage_6_qa_phase(self, messages: List[Dict[str, str]], max_qa_retries: int = 3) -> bool:
+    async def run_stage_6_qa_phase(self, messages: list, max_qa_retries: int = 3) -> bool:
         """
-        Stage 6: The Mechanical Test Gate micro-loop.
-        This provides immediate feedback if the patch breaks baseline tests.
+        Stage 6: The Mechanical Test Gate micro-loop with TARGETED FEEDBACK.
+        This provides immediate feedback and forces the LLM to run isolated, rapid tests.
         """
         for attempt in range(1, max_qa_retries + 1):
             logger.info(f"--- QA GATE ATTEMPT {attempt}/{max_qa_retries} ---")
             
-            # Execute Smarter Gate (Stage 5 logic)
-            passed, test_logs = self.test_engine.run_test_gate()
+            # 1. Execute Smarter Gate (Stage 5 logic - Secret 6)
+            # Note: Ensure your AgentLoop __init__ maps the test engine to self.tester 
+            # (e.g., self.tester = tester) to match server.py
+            gate_passed, gate_msg = self.tester.verify_patch()
             
-            if passed:
-                logger.info("QA Gate Passed. Solution is viable.")
+            if gate_passed:
+                logger.info("QA Gate Passed. Solution is viable and regression-free.")
                 return True
                 
-            logger.warning(f"QA Gate Failed on attempt {attempt}. Injecting logs for repair.")
+            logger.warning(f"QA Gate Failed on attempt {attempt}. Injecting targeted logs for repair.")
             
-            # Anchor the correction in the existing context window
+            # 2. Anchor the correction using the TARGETED FEEDBACK concept
             qa_instruction = (
-                "CRITICAL: The test gate failed. Your patch caused regressions or failed to fix the issue.\n"
-                f"### TEST FAILURE LOGS\n{test_logs}\n\n"
-                "Review the logs and provide a fix via bash commands. Submit again when resolved."
+                f"CRITICAL: The broad test suite failed. Here are the specific tests that are failing:\n"
+                f"{gate_msg}\n\n"
+                f"CRITICAL INSTRUCTION: Do NOT run the entire test suite again. It is too slow. "
+                f"Use your bash shell to run ONLY the specific failing tests isolated above "
+                f"(e.g., `pytest path/to/test_file.py::test_specific_function -x` or `npm test -- -t 'test_name'`).\n"
+                f"Iterate rapidly using these targeted tests until they pass. Only use the 'submit' action when resolved."
             )
             messages.append({"role": "user", "content": qa_instruction})
             
-            # Allow a 5-turn 'repair burst' per QA failure
+            # 3. Allow a 5-turn 'repair burst' per QA failure
             for sub_turn in range(5):
                 raw_response = await self.llm.generate_step(messages)
                 messages.append({"role": "assistant", "content": raw_response})
@@ -185,7 +190,7 @@ class AgentLoop:
                 _, action_type, action_content = self.llm.parse_response(raw_response)
                 
                 if action_type == "submit":
-                    break # Re-run the main test gate
+                    break # Break inner loop to re-run the main broad test gate
                 
                 if action_type == "bash":
                     exit_code, output = self.docker.execute_command(action_content)
