@@ -32,17 +32,68 @@ class LLMClient:
         )
 
     async def generate_step(self, messages: List[Dict[str, str]], temperature: float = 0.15) -> str:
+        """
+        Generates a single turn with multi-layer protection:
+        1. Context Pruning (Stops Token Explosion)
+        2. Provider Routing (Blocks AtlasCloud)
+        3. HTML Error Detection (Paranoid Shield)
+        4. Empty Response Recovery
+        """
+        
+        # --- LAYER 1: THE CONTEXT SQUEEZER ---
+        # If the history is too long, we keep the System prompt (0), 
+        # the Problem Statement (1), and only the most recent 12 turns.
+        if len(messages) > 16:
+            logger.warning(f"Context saturated ({len(messages)} turns). Pruning to save tokens and IQ.")
+            system_msg = messages[0]
+            task_msg = messages[1]
+            # Keeping the last 10 messages (5 turns of thought/action/observation)
+            recent_context = messages[-10:]
+            messages = [system_msg, task_msg] + recent_context
+
         try:
+            # --- LAYER 2: THE PROVIDER SHIELD ---
             response = await self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=4096,
-                stop=["<observation>", "</observation>"] 
+                stop=["<observation>", "</observation>"],
+                extra_body={
+                    "provider": {
+                        "order": ["DeepInfra","Parasail", "NovitaAI"],
+                        "allow_fallbacks": True,
+                        "ignore": ["AtlasCloud"]  # Banned for aggressive WAF
+                    }
+                }
             )
-            return response.choices[0].message.content
+            
+            content = response.choices[0].message.content
+
+            # --- LAYER 3: THE PARANOID SHIELD ---
+            # Catch cases where a provider returns a 200 OK but the body is Cloudflare HTML
+            if content and ("<html" in content.lower() or "cloudflare" in content.lower()):
+                logger.error("Detected HTML/Cloudflare leak in successful API response.")
+                raise ValueError("API provider returned HTML error page instead of LLM text.")
+
+            # --- LAYER 4: EMPTY RESPONSE RECOVERY ---
+            # If the model 'chokes' and returns nothing, try one high-temp 'nudge'
+            if not content or not content.strip():
+                logger.warning("Received empty response. Retrying with higher temperature nudge...")
+                retry_response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.7, # Increased entropy to force an output
+                    max_tokens=4096,
+                    extra_body={"provider": {"ignore": ["AtlasCloud"]}}
+                )
+                content = retry_response.choices[0].message.content
+
+            return content or ""
+
         except Exception as e:
             logger.error(f"LLM API call failed: {e}")
+            # Raising lets the sanitized exception handler in agent_loop.py take over
             raise
 
     def parse_response(self, raw_text: str) -> tuple[str, str, str]:

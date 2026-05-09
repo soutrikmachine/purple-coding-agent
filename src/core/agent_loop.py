@@ -145,6 +145,19 @@ class AgentLoop:
                     logger.info(f"Action [Bash]: {action_content}")
                     exit_code, output = self.docker.execute_command(action_content)
                     
+                    # --- FIX: THE TOKEN SHIELD ---
+                    # 3000 chars is roughly 750 tokens. Enough for grep/test results, small enough to save money.
+                    MAX_CHARS = 3000
+                    if len(output) > MAX_CHARS:
+                        logger.warning(f"Output truncated. Original length: {len(output)} chars.")
+                        half_limit = MAX_CHARS // 2
+                        # Keep the top and the bottom of the output (usually where errors live)
+                        output = (
+                            output[:half_limit] + 
+                            f"\n\n... [SYSTEM WARNING: OUTPUT TRUNCATED. REMOVED {len(output) - MAX_CHARS} CHARS] ...\n\n" + 
+                            output[-half_limit:]
+                        )
+                    
                     # 5. Inject ground-truth observation back into context
                     observation = self.llm.format_observation(output, exit_code)
                     messages.append({"role": "user", "content": observation})
@@ -155,11 +168,20 @@ class AgentLoop:
                     })
                     
             except Exception as e:
-                logger.error(f"Critical execution error in REPL turn {turn}: {e}")
-                # We do not break here; allow the loop to continue and potentially recover
+                error_str = str(e)
+                logger.error(f"Critical execution error in REPL turn {turn}: {error_str[:200]}...") # Only log the start
+                
+                # --- FIX: ANTI-POISON SHIELD ---
+                # Strip out massive HTML blocks or provider metadata
+                if "<html" in error_str.lower() or "cloudflare" in error_str.lower() or len(error_str) > 300:
+                    clean_error = "Provider blocked the request (WAF/Firewall) or returned a massive error. Do NOT repeat the previous bash command. Try a smaller, different command."
+                else:
+                    clean_error = error_str
+                # -------------------------------
+
                 messages.append({
                     "role": "user",
-                    "content": f"<observation status=\"FAILED\">Critical internal error: {str(e)}.</observation>"
+                    "content": f"<observation status=\"FAILED\">Critical System/API Error: {clean_error}</observation>"
                 })
 
         logger.warning("Agent reached maximum turns without submitting.")
