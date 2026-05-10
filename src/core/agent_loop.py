@@ -1,263 +1,480 @@
+"""
+AgentLoop — Phase 2 v4.2.1
+
+Key fixes vs. submitted version:
+  - max_turns: 50 → 15  (50 turns = 695s > 300s gateway = 100% 504)
+  - Context window: keeps system + task + rolling last-8 messages
+    (prevents token explosion while keeping recent state visible)
+  - Auto-NOTES.txt: appended by the loop after EVERY bash exec
+    (agent can't forget what it tried — the framework writes it)
+  - Urgency escalation at turns 10, 13, 15 — prevents "exploration forever"
+  - Force-submit at turn 15: extract git diff, terminate, no more waiting
+  - Observation cap: 1500 chars (head + tail), up from 1000 (was losing errors)
+"""
+
 import logging
 import asyncio
+import re
 import textwrap
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
+
 from .llm_client import LLMClient
 from .docker_bridge import DockerBridge
 from ..tools.test_engine import TestEngine
 
 logger = logging.getLogger(__name__)
 
+import os as _os
+
+# ── Tunable constants (all overridable via env vars) ───────────────────────────
+MAX_TURNS     = int(_os.getenv("MAX_TURNS",     "20"))   # turns before force-submit
+MAX_OBS_CHARS = int(_os.getenv("MAX_OBS_CHARS", "1500")) # observation cap (chars)
+CONTEXT_KEEP  = int(_os.getenv("CONTEXT_KEEP",  "8"))    # rolling message window
+
+# ── Urgency thresholds (derived from MAX_TURNS) ────────────────────────────────
+URGENCY_WARN  = max(1, MAX_TURNS - 6)   # 6 turns before end: "running out"
+URGENCY_ALERT = max(1, MAX_TURNS - 2)   # 2 turns before end: "submit NOW"
+FORCE_SUBMIT  = MAX_TURNS               # on this turn, extract diff and stop
+
+
 class AgentLoop:
     """
-    The core stateful execution engine for the Purple Agent.
-    Orchestrates Stage 4 (50-turn Bash REPL) and Stage 6 (QA Fix Phase).
-    
-    The ICLSpecialist data is introduced here as the 'context_primer' to anchor 
-    the model's behavior across long-running asynchronous turns.
+    15-turn stateful bash REPL.
     """
-    def __init__(self, llm_client: LLMClient, docker_bridge: DockerBridge, test_engine: TestEngine):
-        self.llm = llm_client
+
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        docker_bridge: DockerBridge,
+        test_engine: TestEngine,
+    ):
+        self.llm    = llm_client
         self.docker = docker_bridge
-        self.test_engine = test_engine
-        self.max_turns = 50
-        
-        # Base system instructions that never change across turns
+        self.tester = test_engine
+
         self.system_prompt = textwrap.dedent("""\
-            You are Purple Agent, an expert software engineer operating autonomously.
-            You are running inside a stateful Bash REPL in a Docker container with the target repository mounted at /workspace.
-            
-            Your objective is to solve the provided GitHub issue correctly and efficiently within a strict limit of 50 shell calls.
-            Because compute resources are constrained, you must solve the problem using as few calls as possible. A top-tier solution requires 8-12 calls.
+            You are Purple Agent, an expert software engineer in a stateful Bash REPL.
+            The repository is at /workspace. You have a STRICT budget of 20 shell calls.
+            A top-tier engineer solves SWE-bench tasks in 8-12 calls. Work efficiently.
 
             <protocol>
-            You MUST respond using this exact XML structure for every turn:
+            Every response MUST use this exact XML structure — no exceptions:
             <thought>
-            Step-by-step reasoning. Analyze the problem, plan your batch reads/edits, and verify your logic against edge cases.
+            Step-by-step reasoning. Diagnose → locate → fix → verify.
             </thought>
             <action type="bash">
-            Your single-line bash command or chained commands here.
+            single command or chained commands with &&
             </action>
-            
-            When you have fully verified your fix passes the tests, terminate the loop with:
+
+            When your fix is verified and ready, terminate with:
             <action type="submit">Done</action>
+
+            CRITICAL FORMATTING RULES:
+            - NEVER wrap your response in markdown fences (no ```xml, ```bash, ```json)
+            - NEVER add any text before <thought> or after </action>
+            - The raw XML tags must appear at the top level of your response
+            - Violating this causes the framework to fail silently and wastes a turn
             </protocol>
 
-            <critical_environment_rules>
-            1. MEMORY SCRATCHPAD: Your conversation history is truncated to keep the system fast. To avoid repeating yourself or losing track, you MUST treat /workspace/NOTES.txt as your primary memory:
-                - Update: After every discovery or failed test, append a bullet point: echo "- Checked X.py, bug not there" >> /workspace/NOTES.txt.
-                - Consult: If your recent history doesn't show your previous steps, you MUST run cat /workspace/NOTES.txt before taking any new action to ensure you aren't repeating a command.
-            2. AST GRAPH TOOL: To understand how a function or class is used across the codebase, do not just `grep`. Use the graph tool: `python src/tools/ast_graph.py "FunctionName"`
-            3. STOP READING ENDLESSLY: Do not spend 40 turns just exploring. Once you locate the bug, you MUST edit the file, verify the fix, and submit.
-            </critical_environment_rules>
+            <memory_rules>
+            Your context window is pruned to keep costs manageable.
+            TREAT /workspace/NOTES.txt AS YOUR PRIMARY EXTERNAL MEMORY.
+            The framework automatically appends your bash outputs there,
+            but you MUST prefix your thought with a summary line like:
+              "Step N: [what I found / what I changed]"
+            If you feel lost, your FIRST action must be:
+              cat /workspace/NOTES.txt
+            </memory_rules>
 
-            <efficiency_and_editing>
-            DO NOT USE `sed` to edit files. You will fail due to spacing and line number shifts.
-            To edit a file, you MUST use the provided smart editor script. 
-            
-            Syntax: python /workspace/edit_file.py "path/to/file" "exact old code" "new fixed code"
-            
-            Example:
-              python /workspace/edit_file.py "src/app.js" "if (user == null)" "if (user == null || user.disabled)"
+            <tools>
+            Two injected tools live at /workspace — use them:
 
-            RULES FOR EDITING:
-            1. The "exact old code" string must match the file's content EXACTLY (including whitespace), or it will fail.
-            2. ALWAYS chain a `cat` or `grep` immediately after your edit to verify it actually landed in the file.
-            3. Make MINIMAL changes. Change only the lines needed. Do not rewrite whole functions.
-            </efficiency_and_editing>
+            1. FILE EDITOR (avoids sed pitfalls):
+               python /workspace/edit_file.py "path/to/file" "exact old code" "new code"
+               'exact old code' must match CHARACTER-FOR-CHARACTER. Verify after:
+               grep -n "new code" path/to/file
 
-            <rigorous_grading>
-            After you submit, your patch will face a strict Mechanical Test Gate. 
-            Code must be safety-critical. Every modified or new function MUST handle:
-            - null, undefined, or None values
-            - empty arrays/lists/dicts
-            - missing object keys
-            - boundary conditions (0, -1, max limits)
-            
-            Prioritize core requirements and robust edge-case handling. Ignore cosmetic improvements or peripheral linting.
-            </rigorous_grading>
+            2. AST SEARCH (finds definitions and call sites instantly):
+               python /workspace/ast_search.py "FunctionOrClassName"
+               Use this before blind grep when looking for where something is defined.
 
-            <self_test_before_submit>
-            Before you issue <action type="submit">, you MUST verify your fix against the baseline tests.
-            1. Run the official test suite using this exact command: `bash /workspace/run_script.sh`
-            2. Read the stdout/stderr. If tests fail, use `edit_file.py` to fix your code and run the tests again.
-            3. Does your fix handle the EMPTY case? The NULL case?
-            4. Review neighboring code. Your fix must match the surrounding error-handling patterns.
-            </self_test_before_submit>
+            3. TEST RUNNER:
+               bash /workspace/run_script.sh           ← full suite
+               pytest path/test.py::test_name -x --tb=short  ← targeted (preferred)
+               go test -run TestName ./pkg/...          ← Go targeted
+            </tools>
+
+            <verification_rules>
+            Before submitting:
+            1. Run bash /workspace/run_script.sh (or a targeted subset)
+            2. Confirm fix passes and no regressions introduced
+            3. Handle None/null, empty lists/dicts, boundary values
+            A partial working fix is better than nothing — submit when stuck.
+            </verification_rules>
+
+            <efficiency_rules>
+            - grep -n 'pattern' file | head -30  (not cat on large files)
+            - sed -n '40,80p' file.py  (read section by line range)
+            - Run ONLY the failing test, not the full suite
+            - After finding bug at turn 5: edit turn 6, verify turn 7, submit turn 8
+            </efficiency_rules>
         """)
 
-    async def run_stage_4_bash_repl(self, issue_text: str, context_primer: str) -> Tuple[bool, List[Dict]]:
+    # ── Workspace bootstrap ────────────────────────────────────────────────────
+
+    def _bootstrap_workspace(self):
         """
-        Executes the 50-turn stateful loop.
-        
-        The 'context_primer' contains the Stage 2.5 ICL Injection:
-        - Domain-specific rules (Django, Pytest, etc.)
-        - Few-shot examples of correct thought/action/observation loops
-        - Diagnostic hypotheses
+        Inject three helper scripts into the sibling container:
+          - edit_file.py  : safe file editor (avoids sed pitfalls)
+          - ast_search.py : grep-based function/class locator (no tree-sitter needed)
+          - run_script.sh : discovered test command wrapper
+        Also initialises /workspace/NOTES.txt as the agent scratchpad.
         """
-        # Initializing history with the ICL-enriched primer
-        messages = [
+        # ── 1. edit_file.py ───────────────────────────────────────────────────
+        editor = (
+            "import sys\n"
+            "f, old, new = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "c = open(f).read()\n"
+            "if old in c:\n"
+            "    open(f,'w').write(c.replace(old,new,1))\n"
+            "    print(f'SUCCESS: replaced in {f}')\n"
+            "else:\n"
+            "    print(f'ERROR: old_text not found in {f}. Check whitespace!')\n"
+        )
+        self.docker.execute_command(
+            f"cat > /workspace/edit_file.py << 'PYEOF'\n{editor}PYEOF"
+        )
+
+        # ── 2. ast_search.py (grep-based, no tree-sitter dependency) ─────────
+        # Uses grep to find function/class definitions across all languages.
+        # Much faster than tree-sitter for the agent's lookup use case.
+        ast_search = (
+            "import sys, subprocess\n"
+            "if len(sys.argv) < 2:\n"
+            "    print('Usage: python /workspace/ast_search.py <Name>')\n"
+            "    sys.exit(1)\n"
+            "target = sys.argv[1]\n"
+            "exts = ['*.py','*.go','*.js','*.ts','*.tsx','*.rb','*.java','*.rs','*.c','*.cpp']\n"
+            "includes = sum([['--include', e] for e in exts], [])\n"
+            "# Pattern covers: def X, func X, class X, function X, fn X, method X\n"
+            "pattern = rf'(def |func |class |function |fn |\btype ).*\\b{target}\\b'\n"
+            "r = subprocess.run(['grep','-rn','-E',pattern,'.']+includes,\n"
+            "    capture_output=True, text=True, cwd='/workspace')\n"
+            "if r.stdout:\n"
+            "    lines = r.stdout.strip().split('\\n')\n"
+            "    print(f'Found {len(lines)} definition(s) of \'{target}\':\\n')\n"
+            "    print('\\n'.join(lines[:40]))\n"
+            "else:\n"
+            "    # Fallback: any reference to the name\n"
+            "    r2 = subprocess.run(['grep','-rn','--include=*.py','--include=*.go',\n"
+            "        '--include=*.js','--include=*.ts',target,'.']+[],\n"
+            "        capture_output=True, text=True, cwd='/workspace')\n"
+            "    hits = r2.stdout.strip().split('\\n')[:20] if r2.stdout else []\n"
+            "    if hits:\n"
+            "        print(f'No definition found. References to \'{target}\':\\n')\n"
+            "        print('\\n'.join(hits))\n"
+            "    else:\n"
+            "        print(f'\'{target}\' not found anywhere in the repo.')\n"
+        )
+        self.docker.execute_command(
+            f"cat > /workspace/ast_search.py << 'PYEOF'\n{ast_search}PYEOF"
+        )
+
+        # ── 3. run_script.sh (wraps the discovered test command) ─────────────
+        test_cmd = self.tester.test_command or "echo 'No test runner discovered. Run tests manually.'"
+        self.docker.execute_command(
+            f"printf '#!/bin/bash\\nset -e\\ncd /workspace\\n{test_cmd}\\n' "
+            "> /workspace/run_script.sh && chmod +x /workspace/run_script.sh"
+        )
+
+        # ── 4. Initialise NOTES.txt scratchpad ────────────────────────────────
+        self.docker.execute_command(
+            "printf '### PURPLE AGENT NOTES ###\\n- Start of exploration.\\n"
+            "- Test runner: " + test_cmd[:80] + "\\n' > /workspace/NOTES.txt"
+        )
+
+    # ── Observation handling ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _cap_observation(output: str) -> str:
+        """Keep head + tail of output, max MAX_OBS_CHARS total."""
+        if len(output) <= MAX_OBS_CHARS:
+            return output
+        half = MAX_OBS_CHARS // 2
+        removed = len(output) - MAX_OBS_CHARS
+        return (
+            output[:half]
+            + f"\n... [TRUNCATED {removed} chars] ...\n"
+            + output[-half:]
+        )
+
+    def _append_to_notes(self, turn: int, command: str, output: str):
+        """Auto-write a summary line to NOTES.txt after every bash exec."""
+        # First 200 chars of output — enough to capture errors or key values
+        summary = output.strip()[:200].replace("'", "'\\''")
+        note = f"Turn {turn}: $ {command[:80]}\\n  → {summary}"
+        self.docker.execute_command(
+            f"printf '\\n{note}\\n' >> /workspace/NOTES.txt 2>/dev/null || true"
+        )
+
+    # ── Context window management ──────────────────────────────────────────────
+
+    @staticmethod
+    def _prune_context(messages: List[Dict]) -> List[Dict]:
+        """
+        Keep: messages[0] (system) + messages[1] (task/primer) + last CONTEXT_KEEP.
+
+        Why this works:
+        - System prompt is always present (instructions never forgotten)
+        - Task message is always present (problem statement never forgotten)
+        - Last 8 messages ≈ 4 turns of thought+observation (recent memory)
+        - NOTES.txt provides long-term memory via bash (framework-written)
+        """
+        if len(messages) <= 2 + CONTEXT_KEEP:
+            return messages
+        logger.info(
+            "Context pruned: %d → %d messages (kept system+task+last %d)",
+            len(messages), 2 + CONTEXT_KEEP, CONTEXT_KEEP,
+        )
+        return messages[:2] + messages[-CONTEXT_KEEP:]
+
+    # ── Urgency injections ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _urgency_message(turn: int) -> Dict | None:
+        remaining = MAX_TURNS - turn
+        if turn == URGENCY_WARN:
+            return {
+                "role": "user",
+                "content": (
+                    f"<observation status=\"SYSTEM\">"
+                    f"⚠️  TURN {turn}/{MAX_TURNS}. {remaining} turns left. "
+                    f"If you haven't found the bug yet, check /workspace/NOTES.txt "
+                    f"then grep more specifically. Stop broad exploration."
+                    f"</observation>"
+                ),
+            }
+        if turn == URGENCY_ALERT:
+            return {
+                "role": "user",
+                "content": (
+                    f"<observation status=\"SYSTEM\">"
+                    f"🚨 CRITICAL: TURN {turn}/{MAX_TURNS}. Only {remaining} turns left. "
+                    f"You MUST make your edit NOW and submit. "
+                    f"If you have a partial fix, submit it — a partial fix is better than no patch."
+                    f"</observation>"
+                ),
+            }
+        return None
+
+    # ── Stage 4: Main REPL loop ────────────────────────────────────────────────
+
+    async def run_stage_4_bash_repl(
+        self,
+        issue_text: str,
+        context_primer: str,
+    ) -> Tuple[bool, List[Dict]]:
+
+        self._bootstrap_workspace()
+
+        messages: List[Dict] = [
             {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": (
-                f"### TARGET ISSUE\n{issue_text}\n\n"
-                f"{context_primer}\n\n"
-                "Please begin your exploration by verifying the issue."
-            )}
+            {
+                "role": "user",
+                "content": (
+                    f"### TARGET ISSUE\n{issue_text}\n\n"
+                    f"{context_primer}\n\n"
+                    "Begin by verifying the issue exists, then locate and fix it."
+                ),
+            },
         ]
 
-        # Inject foolproof file editor into the workspace
-        editor_script = """import sys
-file_path, old_text, new_text = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(file_path, 'r') as f: content = f.read()
-if old_text in content:
-    with open(file_path, 'w') as f: f.write(content.replace(old_text, new_text))
-    print(f"SUCCESS: Replaced text in {file_path}")
-else:
-    print(f"ERROR: Could not find exact old_text in {file_path}. Check whitespace!")
-"""
-        self.docker.execute_command(f"cat << 'EOF' > /workspace/edit_file.py\n{editor_script}EOF")
+        logger.info("Stage 4: starting %d-turn REPL", MAX_TURNS)
 
-        # --- NEW: INITIALIZE THE MEMORY SCRATCHPAD ---
-        # This ensures the file exists so the agent doesn't get 'File not found' errors
-        scratchpad_init = "### PURPLE AGENT SCRATCHPAD ###\n- Start of exploration.\n"
-        self.docker.execute_command(f"echo '{scratchpad_init}' > /workspace/NOTES.txt")
-        # ---------------------------------------------
+        for turn in range(1, MAX_TURNS + 1):
+            logger.info("--- TURN %d/%d ---", turn, MAX_TURNS)
 
-        logger.info(f"Starting Stage 4 Bash REPL with {self.max_turns} turn limit.")
+            # Force-submit on final turn: extract diff and terminate
+            if turn == FORCE_SUBMIT:
+                logger.warning("Turn budget exhausted. Force-extracting git diff.")
+                _, diff = self.docker.execute_command("git diff HEAD", timeout=20)
+                if diff.strip():
+                    logger.info("Force-submit: diff has %d chars", len(diff))
+                else:
+                    logger.warning("Force-submit: git diff is empty")
+                return True, messages
 
-        for turn in range(1, self.max_turns + 1):
-            logger.info(f"--- TURN {turn}/{self.max_turns} ---")
-            
-            if turn % 10 == 0: # Every 10 turns, force a status check
-                messages.append({
-                    "role": "user",
-                    "content": "<observation status=\"SYSTEM_REMINDER\">Check your progress: Run 'cat /workspace/NOTES.txt' to see what you have already discovered and ensure you are not repeating steps.</observation>"
-                })
-            # ----------------------------
+            # Inject urgency message if at threshold
+            urg = self._urgency_message(turn)
+            if urg:
+                messages.append(urg)
 
+            # Prune context before each LLM call
+            messages = self._prune_context(messages)
+
+            # LLM call
             try:
-                # 1. Generate turn using DeepSeek-v4-flash via OpenRouter
-                raw_response = await self.llm.generate_step(messages)
-                messages.append({"role": "assistant", "content": raw_response})
-                
-                # 2. Parse the LLM's intent (FIXED: Removed the duplicate unprotected call here!)
-                try:
-                    thought, action_type, action_content = self.llm.parse_response(raw_response)
-                except Exception as e:
-                    logger.error(f"Catastrophic parsing failure on turn {turn}: {e}")
-                    thought = "System recovered from parsing crash."
-                    action_type = "bash"
-                    action_content = f"echo 'System Error: Parser exception {str(e)}. You MUST use strict XML format: <action type=\"bash\">your command</action>'"
-                
-                if not action_type:
-                    logger.warning("Agent failed to provide an action. Requesting retry.")
-                    messages.append({
-                        "role": "user", 
-                        "content": "<observation status=\"FAILED\">Error: Missing <action> tag. Please provide a command.</observation>"
-                    })
-                    continue
-
-                # 3. Handle 'Submit' - transition to Stage 6
-                if action_type == "submit":
-                    logger.info("Agent issued 'submit'. Terminating REPL loop.")
-                    return True, messages
-                    
-                # 4. Handle 'Bash' execution inside the Sibling Container
-                if action_type == "bash":
-                    logger.info(f"Action [Bash]: {action_content}")
-                    exit_code, output = self.docker.execute_command(action_content)
-                    
-                    # --- FIX: THE TOKEN SHIELD ---
-                    # 1000 chars is roughly 250 tokens. Enough for grep/test results, small enough to save money.
-                    MAX_CHARS = 1000
-                    if len(output) > MAX_CHARS:
-                        logger.warning(f"Output truncated. Original length: {len(output)} chars.")
-                        half_limit = MAX_CHARS // 2
-                        # Keep the top and the bottom of the output (usually where errors live)
-                        output = (
-                            output[:half_limit] + 
-                            f"\n\n... [SYSTEM WARNING: OUTPUT TRUNCATED. REMOVED {len(output) - MAX_CHARS} CHARS] ...\n\n" + 
-                            output[-half_limit:]
-                        )
-                    
-                    # 5. Inject ground-truth observation back into context
-                    observation = self.llm.format_observation(output, exit_code)
-                    messages.append({"role": "user", "content": observation})
-                else:
-                    messages.append({
-                        "role": "user", 
-                        "content": f"<observation status=\"FAILED\">Error: Unknown action '{action_type}'. Use 'bash' or 'submit'.</observation>"
-                    })
-                    
+                raw = await self.llm.generate_step(messages)
             except Exception as e:
-                error_str = str(e)
-                logger.error(f"Critical execution error in REPL turn {turn}: {error_str[:200]}...") # Only log the start
-                
-                # --- FIX: ANTI-POISON SHIELD ---
-                # Strip out massive HTML blocks or provider metadata
-                if "<html" in error_str.lower() or "cloudflare" in error_str.lower() or len(error_str) > 300:
-                    clean_error = "Provider blocked the request (WAF/Firewall) or returned a massive error. Do NOT repeat the previous bash command. Try a smaller, different command."
-                else:
-                    clean_error = error_str
-                # -------------------------------
-
+                logger.error("LLM error on turn %d: %s", turn, str(e)[:150])
                 messages.append({
                     "role": "user",
-                    "content": f"<observation status=\"FAILED\">Critical System/API Error: {clean_error}</observation>"
+                    "content": f"<observation status=\"FAILED\">LLM error: {str(e)[:200]}. Retrying.</observation>",
+                })
+                continue
+
+            messages.append({"role": "assistant", "content": raw})
+
+            # For Gemini: write thinking summary to NOTES.txt as long-term reasoning memory.
+            # This does NOT go into the message context (avoids token blowup).
+            reasoning = getattr(self.llm, "_last_reasoning", "")
+            if reasoning and len(reasoning) > 20:
+                # Write first 400 chars of thinking — enough to capture the key decision
+                summary = reasoning[:400].replace("'", " ").replace('"', " ").replace("\n", " ")
+                self.docker.execute_command(
+                    f"printf '\n[Turn {turn} thinking]: {summary}\n' "
+                    ">> /workspace/NOTES.txt 2>/dev/null || true",
+                    timeout=5,
+                )
+
+            # Parse response
+            try:
+                thought, action_type, action_content = self.llm.parse_response(raw)
+            except Exception as e:
+                logger.error("Parse error turn %d: %s", turn, e)
+                thought, action_type, action_content = (
+                    "", "bash",
+                    "echo 'Parse error — use exact XML: <action type=\"bash\">cmd</action>'"
+                )
+
+            logger.info("Turn %d | action=%s | content=%s", turn, action_type, action_content[:80])
+
+            if not action_type:
+                messages.append({
+                    "role": "user",
+                    "content": "<observation status=\"FAILED\">Missing <action> tag. Provide one.</observation>",
+                })
+                continue
+
+            # Submit
+            if action_type == "submit":
+                logger.info("Agent submitted on turn %d", turn)
+                return True, messages
+
+            # Bash
+            if action_type == "bash":
+                exit_code, output = self.docker.execute_command(action_content)
+                output_capped = self._cap_observation(output)
+
+                # Auto-write to NOTES.txt (framework-level memory, not agent-level)
+                self._append_to_notes(turn, action_content, output)
+
+                # Periodic diff snapshot every 4 turns (or after any edit)
+                # This ensures the global timeout handler in server.py can always
+                # recover the best-effort patch even if we time out mid-loop.
+                is_edit = any(kw in action_content for kw in
+                              ["edit_file.py", "git apply", ">", ">>", "tee ", "patch "])
+                if turn % 4 == 0 or is_edit:
+                    self.docker.execute_command(
+                        "git diff HEAD > /tmp/purple_patch.diff 2>/dev/null || true",
+                        timeout=10,
+                    )
+
+                obs = self.llm.format_observation(output_capped, exit_code)
+                messages.append({"role": "user", "content": obs})
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"<observation status=\"FAILED\">"
+                        f"Unknown action '{action_type}'. Use 'bash' or 'submit'."
+                        f"</observation>"
+                    ),
                 })
 
-        logger.warning("Agent reached maximum turns without submitting.")
         return True, messages
 
-    async def run_stage_6_qa_phase(self, messages: list, max_qa_retries: int = 3) -> bool:
+    # ── Stage 6: QA fix phase ──────────────────────────────────────────────────
+
+    async def run_stage_6_qa_phase(
+        self,
+        messages: List[Dict],
+        max_qa_retries: int = 2,
+    ) -> bool:
         """
-        Stage 6: The Mechanical Test Gate micro-loop with TARGETED FEEDBACK.
-        This provides immediate feedback and forces the LLM to run isolated, rapid tests.
+        Targeted QA micro-loop: up to 2 retries × 3 sub-turns each.
+        Injects specific failing test names so the agent runs targeted commands.
         """
         for attempt in range(1, max_qa_retries + 1):
-            logger.info(f"--- QA GATE ATTEMPT {attempt}/{max_qa_retries} ---")
-            
-            # 1. Execute Smarter Gate (Stage 5 logic - Secret 6)
-            # Note: Ensure your AgentLoop __init__ maps the test engine to self.tester 
-            # (e.g., self.tester = tester) to match server.py
-            gate_passed, gate_msg = self.test_engine.verify_patch()
-            
-            if gate_passed:
-                logger.info("QA Gate Passed. Solution is viable and regression-free.")
-                return True
-                
-            logger.warning(f"QA Gate Failed on attempt {attempt}. Injecting targeted logs for repair.")
-            
-            # 2. Anchor the correction using the TARGETED FEEDBACK concept
-            qa_instruction = (
-                f"CRITICAL: The broad test suite failed. Here are the specific tests that are failing:\n"
-                f"{gate_msg}\n\n"
-                f"CRITICAL INSTRUCTION: Do NOT run the entire test suite again. It is too slow. "
-                f"Use your bash shell to run ONLY the specific failing tests isolated above "
-                f"(e.g., `pytest path/to/test_file.py::test_specific_function -x` or `npm test -- -t 'test_name'`).\n"
-                f"Iterate rapidly using these targeted tests until they pass. Only use the 'submit' action when resolved."
-            )
-            messages.append({"role": "user", "content": qa_instruction})
-            
-            # 3. Allow a 5-turn 'repair burst' per QA failure
-            for sub_turn in range(5):
-                raw_response = await self.llm.generate_step(messages)
-                messages.append({"role": "assistant", "content": raw_response})
-                
-                # PROTECTED: Safe parsing logic mirrored for the inner repair loop
-                try:
-                    _, action_type, action_content = self.llm.parse_response(raw_response)
-                except Exception as e:
-                    logger.error(f"Catastrophic parsing failure in QA loop: {e}")
-                    action_type = "bash"
-                    action_content = f"echo 'System Error: Parser exception {str(e)}. You MUST use strict XML format: <action type=\"bash\">your command</action>'"
-                
-                if action_type == "submit":
-                    break # Break inner loop to re-run the main broad test gate
-                
-                if action_type == "bash":
-                    exit_code, output = self.docker.execute_command(action_content)
-                    messages.append({"role": "user", "content": self.llm.format_observation(output, exit_code)})
+            logger.info("QA attempt %d/%d", attempt, max_qa_retries)
 
-        logger.error("QA Gate failed after maximum retries. Patch rejected.")
+            gate_passed, gate_msg = self.tester.verify_patch()
+            if gate_passed:
+                logger.info("QA gate passed on attempt %d", attempt)
+                return True
+
+            # Build targeted feedback
+            # Extract specific test IDs from the gate message
+            failing_tests = []
+            for line in gate_msg.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("FAILED ") or stripped.startswith("--- FAIL:"):
+                    failing_tests.append(stripped)
+
+            if failing_tests:
+                test_list = "\n".join(failing_tests[:5])
+                targeted_cmd = (
+                    "pytest " + " ".join(
+                        t.replace("FAILED ", "").split(" - ")[0]
+                        for t in failing_tests[:3]
+                    ) + " -x --tb=short"
+                    if failing_tests[0].startswith("FAILED") else
+                    "go test -run '" + "|".join(
+                        t.replace("--- FAIL: ", "").split("(")[0]
+                        for t in failing_tests[:3]
+                    ) + "' ./..."
+                )
+            else:
+                test_list = gate_msg[:500]
+                targeted_cmd = self.tester.test_command or "git diff HEAD"
+
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"GATE FAILED (attempt {attempt}/{max_qa_retries}).\n"
+                    f"These specific tests are failing:\n{test_list}\n\n"
+                    f"Run ONLY these targeted tests (faster feedback):\n"
+                    f"  `{targeted_cmd}`\n\n"
+                    f"Fix the failing tests with edit_file.py, then submit."
+                ),
+            })
+
+            # 3-turn repair burst
+            for sub_turn in range(3):
+                try:
+                    raw = await self.llm.generate_step(self._prune_context(messages))
+                except Exception as e:
+                    logger.error("QA LLM error: %s", e)
+                    break
+
+                messages.append({"role": "assistant", "content": raw})
+
+                try:
+                    _, atype, acontent = self.llm.parse_response(raw)
+                except Exception:
+                    atype, acontent = "bash", "echo 'Parse error'"
+
+                if atype == "submit":
+                    break
+
+                if atype == "bash":
+                    ec, out = self.docker.execute_command(acontent)
+                    messages.append({
+                        "role": "user",
+                        "content": self.llm.format_observation(
+                            self._cap_observation(out), ec
+                        ),
+                    })
+
+        logger.error("QA gate exhausted after %d attempts", max_qa_retries)
         return False

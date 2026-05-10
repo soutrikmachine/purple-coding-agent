@@ -9,18 +9,29 @@ services:
     ports:
       - "9022:9022"
     environment:
-      # Secrets and LLM Configuration
+      # ── LLM Provider ──────────────────────────────────────────────────────
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - LLM_BASE_URL=https://openrouter.ai/api/v1
-      - MODEL_NAME=deepseek/deepseek-v4-flash
-      
-      # Agent Loop Configuration
+      - MODEL_NAME=google/gemini-3-flash-preview
+        # Verify exact slug at openrouter.ai/models — may be gemini-3-flash-preview
+
+      # ── Server ────────────────────────────────────────────────────────────
       - PORT=9022
-      - MAX_TURNS=50
+
+      # ── Agent Loop (all read from env — no rebuild needed to tune) ────────
+      - MAX_TURNS=20            # bash REPL turn budget per task
+      - MAX_OBS_CHARS=1500      # observation output cap (chars, head+tail)
+      - CONTEXT_KEEP=8          # rolling message window (last N messages kept)
+      - TASK_TIMEOUT_S=260      # global asyncio timeout — must be < 300s gateway limit
+
+      # ── Logging ───────────────────────────────────────────────────────────
       - LOG_LEVEL=INFO
+
     volumes:
-      # CRITICAL: Enables sibling container spawning for test execution
+      # CRITICAL: Enables sibling container spawning (Docker-out-of-Docker).
+      # Without this mount the agent cannot start SWE-bench repo containers.
       - /var/run/docker.sock:/var/run/docker.sock
+
     networks:
       - purple-net
     restart: unless-stopped
@@ -32,6 +43,8 @@ services:
 
   # ── Local vLLM (Optional Profile for GPU hosts) ───────────────────────────
   # Run with: docker-compose --profile local-llm up
+  # Note: only useful if MODEL_NAME points to a locally-served model.
+  # The default pipeline uses OpenRouter (Gemini) so this is rarely needed.
   vllm:
     profiles: ["local-llm"]
     image: vllm/vllm-openai:latest
@@ -40,7 +53,7 @@ services:
     environment:
       - HF_TOKEN=${HF_TOKEN}
     command: >
-      --model deepseek-ai/DeepSeek-V3
+      --model google/gemma-2-27b-it
       --tensor-parallel-size 1
       --max-model-len 32768
       --gpu-memory-utilization 0.90

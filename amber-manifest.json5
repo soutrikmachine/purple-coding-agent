@@ -34,8 +34,8 @@
       "OPENROUTER_API_KEY": "${config.openrouter_key}",
       "GITHUB_TOKEN": "${config.github_token}",
       "LLM_BASE_URL": "https://openrouter.ai/api/v1",
-      "MODEL_NAME": "deepseek/deepseek-v4-flash",
-      "MAX_TURNS": "50"
+      "MODEL_NAME": "google/gemini-3-flash-preview",
+      "MAX_TURNS": "20"
     },
 
     "network": {

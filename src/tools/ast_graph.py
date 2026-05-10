@@ -73,11 +73,24 @@ class ASTGraphBuilder:
         def get_text(node: Node) -> str:
             return source_code[node.start_byte:node.end_byte].decode('utf-8')
 
-        for node, capture_name in captures.items():
+        # tree-sitter ≥ 0.21: captures() returns dict[str, list[Node]]
+        # tree-sitter < 0.21: captures() returns list of (Node, str) tuples
+        # Handle both APIs:
+        if isinstance(captures, dict):
+            capture_iter = [
+                (node, name)
+                for name, nodes in captures.items()
+                for node in (nodes if isinstance(nodes, list) else [nodes])
+            ]
+        else:
+            capture_iter = captures  # old API: list of (Node, str)
+
+        for node, capture_name in capture_iter:
             if capture_name in ["import", "import_from"]:
-                # Limit import text length to avoid massive inline require strings
                 import_text = get_text(node).strip()
-                skeleton["imports"].append(import_text[:100] + "..." if len(import_text) > 100 else import_text)
+                skeleton["imports"].append(
+                    import_text[:100] + "..." if len(import_text) > 100 else import_text
+                )
             elif capture_name == "class_name":
                 skeleton["classes"].append(get_text(node))
             elif capture_name == "func_name":

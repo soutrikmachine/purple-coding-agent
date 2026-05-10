@@ -18,19 +18,18 @@
 # Run (with external vLLM):
 #   docker run -p 9022:9022 \
 #     -e LLM_BASE_URL=http://your-vllm-host:8000 \
-#     -e MODEL_NAME=deepseek/deepseek-v4-flash \
+#     -e MODEL_NAME=google/gemini-3-flash-preview \
 #     purple-agent:latest
 #
 # Run (with local HuggingFace, requires GPU):
 #   docker run --gpus all -p 9022:9022 \
 #     -e LLM_BASE_URL=local \
-#     -e MODEL_NAME=deepseek/deepseek-v4-flash \
+#     -e MODEL_NAME=google/gemini-3-flash-preview \
 #     purple-agent:latest
 # =============================================================================
 
 FROM python:3.11-slim
 
-# Fix: Set PYTHONPATH to /app so 'src.server:app' is findable
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
@@ -38,32 +37,39 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# The Elite Fix: Official Docker CLI installation
+# Install system dependencies + official Docker CLI
+# Docker CLI is required for Docker-out-of-Docker (sibling container spawning)
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gcc python3-dev ca-certificates gnupg && \
     install -m 0755 -d /etc/apt/keyrings && \
-    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+         -o /etc/apt/keyrings/docker.asc && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
-    # Dynamically grab the Debian version codename (e.g., bookworm/bullseye) for the repo
     . /etc/os-release && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $VERSION_CODENAME stable" \
+    echo "deb [arch=$(dpkg --print-architecture) \
+         signed-by=/etc/apt/keyrings/docker.asc] \
+         https://download.docker.com/linux/debian $VERSION_CODENAME stable" \
     > /etc/apt/sources.list.d/docker.list && \
-    apt-get update && apt-get install -y --no-install-recommends docker-ce-cli && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends docker-ce-cli && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy build config and code
+# Copy build config and source
 COPY pyproject.toml .
 COPY src/ ./src/
-COPY scripts/ ./scripts/
+COPY tests/ ./tests/
 
-# Install with uvicorn[standard]
+# Copy scripts directory — || true guards against empty scripts/ dir
+COPY scripts/ ./scripts/
+# Fix: glob fails if no .sh files exist — || true makes it non-fatal
+RUN chmod +x scripts/*.sh 2>/dev/null || true
+
+# Install all dependencies from pyproject.toml
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
 
-RUN chmod +x scripts/*.sh
-
 EXPOSE 9022
 
-# Ensure we bind to 0.0.0.0 (mandatory for container networking)
+# Bind to 0.0.0.0 — mandatory for container networking
 CMD ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "9022"]
