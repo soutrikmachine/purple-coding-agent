@@ -117,7 +117,7 @@ If global timeout fires: reads /tmp/purple_patch.diff as best-effort patch
 
 ## Estimated Cost per Run (100 tasks)
 
-With `google/gemini-2.5-flash-preview` via OpenRouter ($1.34/M input · $3/M output):
+With `google/gemini-3-flash-preview` via OpenRouter ($1.34/M input · $3/M output):
 
 | Component | Tokens/task | Cost/task |
 |---|---|---|
@@ -165,7 +165,7 @@ All tunable without rebuilding the image:
 | Variable | Default | Description |
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | OpenRouter API key (required) |
-| `MODEL_NAME` | `google/gemini-2.5-flash-preview` | OpenRouter model slug — verify at openrouter.ai/models |
+| `MODEL_NAME` | `google/gemini-3-flash-preview` | OpenRouter model slug — verify at openrouter.ai/models |
 | `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | LLM endpoint |
 | `MAX_TURNS` | `20` | REPL turn budget (hard cap — force-submits at this turn) |
 | `MAX_OBS_CHARS` | `1500` | Observation output cap (head+tail, prevents token explosion) |
@@ -182,7 +182,7 @@ All tunable without rebuilding the image:
 docker run -p 9022:9022 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e OPENROUTER_API_KEY=your_key \
-  -e MODEL_NAME=google/gemini-2.5-flash-preview \
+  -e MODEL_NAME=google/gemini-3-flash-preview \
   rimodock/purple-coding-agent:latest
 
 # Health check

@@ -26,8 +26,8 @@ class LLMClient:
         self.base_url   = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
         # OpenRouter slug for Gemini 3 Flash Preview.
         # Verify at: https://openrouter.ai/models — search "gemini"
-        # Common slugs: google/gemini-2.5-flash-preview or google/gemini-3-flash-preview
-        self.model_name = os.getenv("MODEL_NAME", "google/gemini-2.5-flash-preview")
+        # Common slugs: google/gemini-3-flash-preview or google/gemini-3-flash-preview
+        self.model_name = os.getenv("MODEL_NAME", "google/gemini-3-flash-preview")
         self.api_key    = (
             os.getenv("OPENROUTER_API_KEY")
             or os.getenv("LLM_API_KEY")
