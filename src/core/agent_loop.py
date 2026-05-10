@@ -44,7 +44,9 @@ class AgentLoop:
             </protocol>
 
             <critical_environment_rules>
-            1. MEMORY SCRATCHPAD: You have a limited context window and WILL forget things. When you find important information (file paths, function names, logic), you MUST save it: `echo 'Found X in file Y' >> /workspace/NOTES.txt`. Read this file if you forget your place.
+            1. MEMORY SCRATCHPAD: Your conversation history is truncated to keep the system fast. To avoid repeating yourself or losing track, you MUST treat /workspace/NOTES.txt as your primary memory:
+                - Update: After every discovery or failed test, append a bullet point: echo "- Checked X.py, bug not there" >> /workspace/NOTES.txt.
+                - Consult: If your recent history doesn't show your previous steps, you MUST run cat /workspace/NOTES.txt before taking any new action to ensure you aren't repeating a command.
             2. AST GRAPH TOOL: To understand how a function or class is used across the codebase, do not just `grep`. Use the graph tool: `python src/tools/ast_graph.py "FunctionName"`
             3. STOP READING ENDLESSLY: Do not spend 40 turns just exploring. Once you locate the bug, you MUST edit the file, verify the fix, and submit.
             </critical_environment_rules>
@@ -115,17 +117,21 @@ else:
 """
         self.docker.execute_command(f"cat << 'EOF' > /workspace/edit_file.py\n{editor_script}EOF")
 
+        # --- NEW: INITIALIZE THE MEMORY SCRATCHPAD ---
+        # This ensures the file exists so the agent doesn't get 'File not found' errors
+        scratchpad_init = "### PURPLE AGENT SCRATCHPAD ###\n- Start of exploration.\n"
+        self.docker.execute_command(f"echo '{scratchpad_init}' > /workspace/NOTES.txt")
+        # ---------------------------------------------
+
         logger.info(f"Starting Stage 4 Bash REPL with {self.max_turns} turn limit.")
 
         for turn in range(1, self.max_turns + 1):
             logger.info(f"--- TURN {turn}/{self.max_turns} ---")
             
-            # --- FIX: THE PANIC NUDGE ---
-            if turn == 40:
-                logger.warning("Turn 40 reached. Injecting Panic Nudge.")
+            if turn % 10 == 0: # Every 10 turns, force a status check
                 messages.append({
                     "role": "user",
-                    "content": "<observation status=\"WARNING\">SYSTEM WARNING: You only have 10 turns left! Stop exploring. You MUST write your fix to the files now using python /workspace/edit_file.py, verify it with bash /workspace/run_script.sh, and then call <action type=\"submit\">Done</action>.</observation>"
+                    "content": "<observation status=\"SYSTEM_REMINDER\">Check your progress: Run 'cat /workspace/NOTES.txt' to see what you have already discovered and ensure you are not repeating steps.</observation>"
                 })
             # ----------------------------
 
@@ -162,8 +168,8 @@ else:
                     exit_code, output = self.docker.execute_command(action_content)
                     
                     # --- FIX: THE TOKEN SHIELD ---
-                    # 3000 chars is roughly 750 tokens. Enough for grep/test results, small enough to save money.
-                    MAX_CHARS = 3000
+                    # 1000 chars is roughly 250 tokens. Enough for grep/test results, small enough to save money.
+                    MAX_CHARS = 1000
                     if len(output) > MAX_CHARS:
                         logger.warning(f"Output truncated. Original length: {len(output)} chars.")
                         half_limit = MAX_CHARS // 2

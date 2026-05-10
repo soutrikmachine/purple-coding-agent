@@ -43,12 +43,12 @@ class LLMClient:
         # --- LAYER 1: THE CONTEXT SQUEEZER ---
         # If the history is too long, we keep the System prompt (0), 
         # the Problem Statement (1), and only the most recent 12 turns.
-        if len(messages) > 40:
+        if len(messages) > 12:
             logger.warning(f"Context saturated ({len(messages)} turns). Pruning to save tokens and IQ.")
             system_msg = messages[0]
             task_msg = messages[1]
             # Keeping the last 10 messages (5 turns of thought/action/observation)
-            recent_context = messages[-30:]
+            recent_context = messages[-10:]
             messages = [system_msg, task_msg] + recent_context
 
         try:
