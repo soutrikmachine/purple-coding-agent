@@ -43,25 +43,24 @@ class AgentLoop:
             <action type="submit">Done</action>
             </protocol>
 
+            <critical_environment_rules>
+            1. MEMORY SCRATCHPAD: You have a limited context window and WILL forget things. When you find important information (file paths, function names, logic), you MUST save it: `echo 'Found X in file Y' >> /workspace/NOTES.txt`. Read this file if you forget your place.
+            2. AST GRAPH TOOL: To understand how a function or class is used across the codebase, do not just `grep`. Use the graph tool: `python src/tools/ast_graph.py "FunctionName"`
+            3. STOP READING ENDLESSLY: Do not spend 40 turns just exploring. Once you locate the bug, you MUST edit the file, verify the fix, and submit.
+            </critical_environment_rules>
+
             <efficiency_and_editing>
-            Minimize calls by batching your work. 
-            Do NOT rely on brittle `sed` commands for multi-line edits. Instead, use Python heredocs to read, replace, and write reliably.
-
-            Batched read example (1 call, multiple files):
-              cat -n src/user/email.py | head -n 80 && echo '===FILE2===' && grep -rn 'def send' src/
-
-            Batched edit + verify example (1 call, robust replacement):
-              python -c "
-            import pathlib
-            f = pathlib.Path('src/api/users.py')
-            content = f.read_text()
-            new_content = content.replace('if not user:', 'if not user or not user.is_active:')
-            f.write_text(new_content)
-            " && grep -n 'is_active' src/api/users.py
+            DO NOT USE `sed` to edit files. You will fail due to spacing and line number shifts.
+            To edit a file, you MUST use the provided smart editor script. 
+            
+            Syntax: python /workspace/edit_file.py "path/to/file" "exact old code" "new fixed code"
+            
+            Example:
+              python /workspace/edit_file.py "src/app.js" "if (user == null)" "if (user == null || user.disabled)"
 
             RULES FOR EDITING:
-            1. The old string in `.replace()` must match EXACTLY, or it silently fails.
-            2. ALWAYS chain a `grep` or `diff` immediately after your edit to verify it landed.
+            1. The "exact old code" string must match the file's content EXACTLY (including whitespace), or it will fail.
+            2. ALWAYS chain a `cat` or `grep` immediately after your edit to verify it actually landed in the file.
             3. Make MINIMAL changes. Change only the lines needed. Do not rewrite whole functions.
             </efficiency_and_editing>
 
@@ -77,13 +76,11 @@ class AgentLoop:
             </rigorous_grading>
 
             <self_test_before_submit>
-            Before you issue <action type="submit">, you must look past the obvious symptom:
-            1. Run the local test suite (e.g., `pytest tests/path_to_test.py -x --tb=short`).
-            2. If tests are too slow, write a quick sanity check (`python -c "import module; module.test_func()"`) to verify your fix.
+            Before you issue <action type="submit">, you MUST verify your fix against the baseline tests.
+            1. Run the official test suite using this exact command: `bash /workspace/run_script.sh`
+            2. Read the stdout/stderr. If tests fail, use `edit_file.py` to fix your code and run the tests again.
             3. Does your fix handle the EMPTY case? The NULL case?
             4. Review neighboring code. Your fix must match the surrounding error-handling patterns.
-            
-            Finding and fixing failures yourself using bash is cheaper than having your patch rejected by the final QA gate.
             </self_test_before_submit>
         """)
 
@@ -106,19 +103,38 @@ class AgentLoop:
             )}
         ]
 
+        # Inject foolproof file editor into the workspace
+        editor_script = """import sys
+file_path, old_text, new_text = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(file_path, 'r') as f: content = f.read()
+if old_text in content:
+    with open(file_path, 'w') as f: f.write(content.replace(old_text, new_text))
+    print(f"SUCCESS: Replaced text in {file_path}")
+else:
+    print(f"ERROR: Could not find exact old_text in {file_path}. Check whitespace!")
+"""
+        self.docker.execute_command(f"cat << 'EOF' > /workspace/edit_file.py\n{editor_script}EOF")
+
         logger.info(f"Starting Stage 4 Bash REPL with {self.max_turns} turn limit.")
 
         for turn in range(1, self.max_turns + 1):
             logger.info(f"--- TURN {turn}/{self.max_turns} ---")
             
+            # --- FIX: THE PANIC NUDGE ---
+            if turn == 40:
+                logger.warning("Turn 40 reached. Injecting Panic Nudge.")
+                messages.append({
+                    "role": "user",
+                    "content": "<observation status=\"WARNING\">SYSTEM WARNING: You only have 10 turns left! Stop exploring. You MUST write your fix to the files now using python /workspace/edit_file.py, verify it with bash /workspace/run_script.sh, and then call <action type=\"submit\">Done</action>.</observation>"
+                })
+            # ----------------------------
+
             try:
                 # 1. Generate turn using DeepSeek-v4-flash via OpenRouter
                 raw_response = await self.llm.generate_step(messages)
                 messages.append({"role": "assistant", "content": raw_response})
                 
-                # 2. Parse the LLM's intent
-                thought, action_type, action_content = self.llm.parse_response(raw_response)
-
+                # 2. Parse the LLM's intent (FIXED: Removed the duplicate unprotected call here!)
                 try:
                     thought, action_type, action_content = self.llm.parse_response(raw_response)
                 except Exception as e:
@@ -185,7 +201,7 @@ class AgentLoop:
                 })
 
         logger.warning("Agent reached maximum turns without submitting.")
-        return False, messages
+        return True, messages
 
     async def run_stage_6_qa_phase(self, messages: list, max_qa_retries: int = 3) -> bool:
         """

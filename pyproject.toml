@@ -19,6 +19,7 @@ dependencies = [
     # Structural Analysis (Graph RAG)
     "tree-sitter>=0.21.3",   # Required for ASTGraphBuilder
     "tree-sitter-python>=0.21.0",
+    "tree-sitter-javascript>=0.21.0",
 
     # HTTP client
     "requests>=2.31.0",

@@ -130,15 +130,16 @@ async def handle_task(request: Request):
         return JSONResponse(content={"error": "Docker bridge failed to init"}, status_code=500)
 
     try:
-        graph_builder = ASTGraphBuilder(repo_path="/workspace")
-        repo_skeleton = graph_builder.build_repo_graph()
+        # --- DISABLE SYNCHRONOUS PRE-FLIGHT TO PREVENT 504 TIMEOUT ---
+        # graph_builder = ASTGraphBuilder(repo_path="/workspace")
+        # repo_skeleton = graph_builder.build_repo_graph()
         
-        tester.discover_and_run_baseline() 
+        # tester.discover_and_run_baseline() 
 
-        hyp_group = await hyp_gen.generate_group(problem_statement, repo_skeleton)
-        context_primer = f"{icl.get_injection(problem_statement, repo_skeleton)}\n" \
-                         f"{icl.get_few_shot_examples()}\n" \
-                         f"{hyp_gen.format_for_primer(hyp_group)}"
+        # hyp_group = await hyp_gen.generate_group(problem_statement, repo_skeleton)
+        
+        # We simplify the context primer since the heavy logic was moved to the prompt
+        context_primer = f"{icl.get_few_shot_examples()}\n"
 
         agent_loop = AgentLoop(llm, docker, tester)
         success, messages = await agent_loop.run_stage_4_bash_repl(problem_statement, context_primer)
