@@ -1,12 +1,17 @@
 """
-Purple Agent v4.2 — Phase 2 server
+Purple Agent v4.2.2 — Phase 2 server
 
-Key changes vs. submitted version:
-  - Global asyncio.wait_for(timeout=260s) around the entire task
-    → Gateway kills at 300s; we return a best-effort patch at 260s
-  - Re-enabled baseline discovery (timeout=45s) and hypotheses (timeout=20s)
-  - Container pull failures are graceful (use local cache)
-  - Patch is always extracted and returned, even on timeout/gate failure
+Pipeline:
+  Stage 1   — Container bootstrap + repo detection
+  Stage 2   — Test command discovery (no execution — avoids 3-4 min stalls)
+  Stage 1.5 — Hypothesis generation (problem_statement + hints_text + file tree)
+  Stage 3   — ICL injection
+  Stage 4   — 20-turn stateful bash REPL
+  Stage 5   — Mechanical test gate
+  Stage 6   — Targeted QA repair (up to 2 retries)
+
+Global 260s asyncio.wait_for wraps the entire pipeline.
+Best-effort patch written to /tmp/purple_patch.diff periodically for timeout recovery.
 """
 
 import os
@@ -31,42 +36,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger("purple_agent")
 
-PORT = int(os.getenv("PORT", "9022"))
-
-# ── Timing budget ──────────────────────────────────────────────────────────────
-# Gateway hard-kills at 300s. Our budget:
-#   container bootstrap : ~40s
-#   preflight (baseline): ~45s
-#   agent loop (15 turns): ~165s
-#   test gate + QA      : ~30s
-#   buffer              : ~20s
-#   ──────────────────────────
-#   total               : ~300s  → wrap at 260s to guarantee response
+PORT                = int(os.getenv("PORT",          "9022"))
 GLOBAL_TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_S", "260"))
+
+# ── Agent card ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Purple Coding Agent (Phase 2)")
 
 AGENT_CARD = {
-    "name": "Purple Coding Agent",
+    "name":        "Purple Coding Agent",
     "description": (
-        "SWE-bench Phase 2: Stateful Bash REPL + Docker-out-of-Docker execution. "
-        "15-turn budget with mechanical test gate and targeted QA repair."
+        "SWE-bench Phase 2: Stateful Bash REPL + Docker-out-of-Docker. "
+        "Hypothesis synthesis from problem_statement + hints_text. "
+        "20-turn budget with mechanical test gate."
     ),
-    "url": f"http://localhost:{PORT}/",
-    "version": "4.2.1",
+    "url":     f"http://localhost:{PORT}/",
+    "version": "4.2.2",
     "capabilities": {
-        "streaming": False,
-        "pushNotifications": False,
+        "streaming":              False,
+        "pushNotifications":      False,
         "stateTransitionHistory": False,
     },
-    "defaultInputModes": ["application/json"],
+    "defaultInputModes":  ["application/json"],
     "defaultOutputModes": ["application/json"],
     "skills": [{
-        "id": "swe_patch",
-        "name": "SWE Patch",
+        "id":          "swe_patch",
+        "name":        "SWE Patch",
         "description": "Bash REPL with live test execution and verified diff output.",
-        "tags": ["coding", "swe-bench", "patch", "docker"],
-        "examples": [],
+        "tags":        ["coding", "swe-bench", "patch", "docker"],
+        "examples":    [],
     }],
 }
 
@@ -83,26 +81,41 @@ async def agent_card_compat():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "4.2.1"}
+    return {"status": "ok", "version": "4.2.2"}
 
 
 # ==============================================================================
-# TASK EXTRACTION  (unchanged from Phase 1 — handles all A2A envelope formats)
+# TASK EXTRACTION
+# Handles all A2A envelope formats sent by the green agent.
+# Extracts ALL fields from instances.jsonl, including hints_text.
 # ==============================================================================
 
 def _extract_task(body: dict) -> tuple[dict, str]:
+    """
+    Parse the A2A JSON-RPC envelope and return (task_data, context_id).
+    task_data includes: problem_statement, repo, docker_image, base_commit,
+                        hints_text, instance_id, short_id
+    """
     context_id = ""
+
+    # Flat body (problem_statement at top level)
     if "problem_statement" in body:
         return body, context_id
+
     try:
-        params  = body.get("params", {})
-        message = params.get("message", {})
+        params     = body.get("params", {})
+        message    = params.get("message", {})
         context_id = message.get("contextId", "") or params.get("contextId", "")
+
         for part in message.get("parts", []):
             kind = part.get("kind") or part.get("type", "")
             text = part.get("text", "")
+
+            # Structured data part
             if kind == "data" and "problem_statement" in part.get("data", {}):
                 return part["data"], context_id
+
+            # JSON-in-text part
             if kind == "text" and text.strip():
                 try:
                     parsed = json.loads(text)
@@ -111,24 +124,31 @@ def _extract_task(body: dict) -> tuple[dict, str]:
                 except Exception:
                     pass
                 return {"problem_statement": text.strip()}, context_id
+
     except Exception as e:
         logger.error("Extraction error: %s", e)
+
     return {}, context_id
 
 
 # ==============================================================================
-# CORE TASK RUNNER  (runs inside the global timeout)
+# CORE TASK RUNNER
 # ==============================================================================
 
 async def _run_task(task_data: dict, llm: LLMClient) -> str:
     """
-    Runs the full pipeline and always returns a unified diff string (may be empty).
-    Designed to complete in ≤ 260 seconds.
+    Full pipeline — always returns a unified diff (may be empty).
+    Designed to complete in ≤ 260s.
     """
     problem_statement = task_data.get("problem_statement", "")
+    hints_text        = task_data.get("hints_text", "")        # ← from instances.jsonl
     image_name        = task_data.get("docker_image", "")
     base_commit       = task_data.get("base_commit", "HEAD")
     repo              = task_data.get("repo", "")
+    instance_id       = task_data.get("instance_id", "")
+
+    if hints_text:
+        logger.info("hints_text present: %d chars", len(hints_text))
 
     if not image_name:
         logger.error("No docker_image in task — cannot start container")
@@ -143,82 +163,98 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
         return ""
 
     try:
-        # ── Stage 2: Test command discovery ONLY (no test execution) ──────────
-        # Heavy baseline execution is removed from pre-flight — it caused 3-4 min stalls.
-        # The agent runs tests inside its bash loop; the gate uses verify_patch() at the end.
-        # We only discover the test command string here so the gate knows what to run.
+        # ── Stage 2: Test command discovery (no execution) ────────────────────
         await asyncio.to_thread(tester.discover_test_command_only)
         logger.info("Test command discovered: %s", tester.test_command or "none")
 
-        # ── Stage 1.5 / 2.5: Hypotheses + ICL injection (capped at 20s) ─────
+        # ── Stage 1.5: File tree + hypothesis generation ──────────────────────
         icl     = ICLSpecialist()
         hyp_gen = HypothesisGenerator(llm)
 
-        # Lightweight repo skeleton: just the file tree, no AST parsing at this stage
-        # (ASTGraphBuilder is too slow for the pre-flight budget; agent uses it via bash)
-        # Use auto-detected repo_dir — NOT hardcoded /workspace
-        # DockerBridge._detect_repo_dir() sets this after container start
         repo_root = docker.repo_dir
         logger.info("Building file tree from repo root: %s", repo_root)
         _, tree_output = await asyncio.to_thread(
             docker.execute_command,
-            (f"find {repo_root} -type f "
-             r"\( -name '*.py' -o -name '*.js' -o -name '*.go' "
-             r"-o -name '*.ts' -o -name '*.rb' -o -name '*.java' -o -name '*.rs' \) "
-             r"| grep -v -E '(node_modules|__pycache__|vendor|dist|build|\.git)' "
-             r"| head -120"),
+            (
+                f"find {repo_root} -type f "
+                r"\( -name '*.py' -o -name '*.js' -o -name '*.go' "
+                r"-o -name '*.ts' -o -name '*.rb' -o -name '*.java' "
+                r"-o -name '*.rs' -o -name '*.kt' \) "
+                r"| grep -v -E '(node_modules|__pycache__|vendor|dist|build|\.git)' "
+                r"| head -120"
+            ),
             30,
         )
-        logger.info("File tree: %d files found", tree_output.count("\n") + (1 if tree_output.strip() else 0))
+        n_files = tree_output.count("\n") + (1 if tree_output.strip() else 0)
+        logger.info("File tree: %d files found", n_files)
 
         try:
             hyps = await asyncio.wait_for(
-                hyp_gen.generate_group(problem_statement, tree_output, g_size=2),
-                timeout=10.0,
+                hyp_gen.generate_group(
+                    problem_statement=problem_statement,
+                    repo_skeleton=tree_output,
+                    g_size=2,
+                    hints_text=hints_text,   # ← passed through now
+                ),
+                timeout=15.0,
             )
+            logger.info("Hypotheses generated: %d", len(hyps))
         except asyncio.TimeoutError:
             logger.warning("Hypothesis generation timed out — continuing without")
             hyps = []
 
-        # Build the context primer: ICL examples + hypotheses + test command
-        icl_block  = icl.get_injection(problem_statement, tree_output)
-        hyp_block  = hyp_gen.format_for_primer(hyps) if hyps else ""
-        test_hint  = (
-            f"\n## Test Command (verified working)\n`{tester.test_command}`\n"
-            f"Run this to check your fix. Baseline pre-existing failures are already known.\n"
+        # ── Stage 3: Build context primer ────────────────────────────────────
+        icl_block = icl.get_injection(problem_statement, tree_output)
+        hyp_block = hyp_gen.format_for_primer(hyps)
+        test_hint = (
+            f"\n## Test Command\n`{tester.test_command}`\n"
+            "Run this to check your fix. Use targeted test invocation when possible.\n"
             if tester.test_command else
-            "\n## Test Command\nNo standard test runner detected. Use `git diff` to verify changes.\n"
+            "\n## Test Command\n"
+            "No standard test runner detected. Explore manually and use `git diff` "
+            "to confirm changes are correct.\n"
         )
+        # Also inject hints_text directly into primer if non-empty
+        hints_primer = ""
+        if hints_text and hints_text.strip():
+            hints_primer = (
+                f"\n## Benchmark Hints\n"
+                f"{hints_text.strip()}\n"
+                "(These hints are from the benchmark annotators — use them to narrow your search)\n"
+            )
 
-        context_primer = icl_block + "\n" + hyp_block + test_hint
+        context_primer = icl_block + "\n" + hyp_block + test_hint + hints_primer
 
-        # ── Stage 4: 15-turn bash REPL ───────────────────────────────────────
+        # ── Stage 4: 20-turn bash REPL ────────────────────────────────────────
         agent = AgentLoop(llm, docker, tester)
         _success, messages = await agent.run_stage_4_bash_repl(
             problem_statement, context_primer
         )
 
-        # ── Stage 5 & 6: Mechanical test gate + targeted QA ──────────────────
+        # ── Stage 5: Mechanical test gate ─────────────────────────────────────
         gate_passed, gate_msg = await asyncio.to_thread(tester.verify_patch)
         logger.info("Test gate: %s — %s", gate_passed, gate_msg[:120])
 
+        # ── Stage 6: Targeted QA repair ───────────────────────────────────────
         if not gate_passed:
             logger.warning("Gate failed. Entering QA phase.")
             gate_passed = await agent.run_stage_6_qa_phase(messages, max_qa_retries=2)
 
-        # ── Always extract git diff (even on gate failure — partial credit) ──
-        # Extract final patch from detected repo root (not /workspace)
-        repo_root = docker.repo_dir
+        # ── Always extract git diff (partial credit on gate failure) ──────────
         _, patch = await asyncio.to_thread(
             docker.execute_command,
-            (f"cd {repo_root} && git ls-files --others --exclude-standard "
-             r"| grep -v -E '(__pycache__|\.pyc$|\.egg-info/)' "
-             r"| xargs -r git add -N -- 2>/dev/null || true && git diff HEAD"),
+            (
+                f"cd {repo_root} && "
+                r"git ls-files --others --exclude-standard "
+                r"| grep -v -E '(__pycache__|\.pyc$|\.egg-info/)' "
+                r"| xargs -r git add -N -- 2>/dev/null || true && "
+                r"git diff HEAD"
+            ),
             30,
         )
         logger.info("Patch extracted: %d chars (gate_passed=%s)", len(patch), gate_passed)
 
-        # Write to /tmp so the timeout handler can recover it even if cancelled
+        # Write snapshot for timeout recovery
         try:
             with open("/tmp/purple_patch.diff", "w") as pf:
                 pf.write(patch)
@@ -247,34 +283,32 @@ async def handle_task(request: Request):
         context_id = str(uuid.uuid4())
 
     logger.info(
-        "Task received | context=%s | repo=%s | image=%s",
+        "Task received | context=%s | repo=%s | instance=%s | hints=%s",
         context_id[:20],
         task_data.get("repo", "?"),
-        task_data.get("docker_image", "?")[:60],
+        task_data.get("instance_id", "?")[:40],
+        "yes" if task_data.get("hints_text", "").strip() else "no",
     )
 
-    llm          = LLMClient()
+    llm           = LLMClient()
     patch_content = ""
 
     try:
-        # Wrap the entire pipeline in a hard timeout — returns best-effort diff.
-        # _run_task always writes git diff to /tmp/purple_patch.diff before returning,
-        # so even on timeout we can try to read it.
         patch_content = await asyncio.wait_for(
             _run_task(task_data, llm),
             timeout=GLOBAL_TASK_TIMEOUT,
         )
     except asyncio.TimeoutError:
         logger.error(
-            "Global task timeout (%ds) fired — reading best-effort diff from /tmp",
+            "Global task timeout (%ds) — reading best-effort diff from /tmp",
             GLOBAL_TASK_TIMEOUT,
         )
         try:
             with open("/tmp/purple_patch.diff") as f:
                 patch_content = f.read()
-            logger.info("Recovered %d-char patch from /tmp/purple_patch.diff", len(patch_content))
+            logger.info("Recovered %d-char patch from /tmp", len(patch_content))
         except Exception:
-            logger.warning("No patch file found — returning empty diff")
+            logger.warning("No /tmp patch file — returning empty diff")
     except Exception as e:
         logger.exception("Unhandled task error: %s", e)
 
@@ -282,7 +316,7 @@ async def handle_task(request: Request):
 
     return JSONResponse(content={
         "jsonrpc": "2.0",
-        "id": jsonrpc_id,
+        "id":      jsonrpc_id,
         "result": {
             "id":        task_id,
             "contextId": context_id,
