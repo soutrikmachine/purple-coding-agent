@@ -176,6 +176,19 @@ class AgentLoop:
             timeout=5,
         )
 
+
+    def _assistant_msg(self, content: str) -> Dict:
+        """
+        Build an assistant message dict, preserving reasoning_details for MiniMax.
+        MiniMax requires reasoning_details to be passed back in subsequent turns
+        for reasoning continuity. Gemini/Claude ignore it harmlessly if present.
+        """
+        msg: Dict = {"role": "assistant", "content": content}
+        rd = getattr(self.llm, "_last_reasoning_details", None)
+        if rd:
+            msg["reasoning_details"] = rd
+        return msg
+
     @staticmethod
     def _prune_context(messages: List[Dict]) -> List[Dict]:
         if len(messages) <= 2 + CONTEXT_KEEP:
@@ -301,9 +314,9 @@ class AgentLoop:
                 })
                 continue
 
-            messages.append({"role": "assistant", "content": raw})
+            messages.append(self._assistant_msg(raw))
 
-            # Gemini reasoning -> NOTES.txt (side-channel, no context pollution)
+            # Gemini/MiniMax reasoning -> NOTES.txt (side-channel, no context pollution)
             reasoning = getattr(self.llm, "_last_reasoning", "")
             if reasoning and len(reasoning) > 20:
                 summary = reasoning[:400].replace("'", " ").replace('"', " ").replace("\n", " ")
@@ -374,9 +387,12 @@ class AgentLoop:
                 # This gives real feedback without burning a model turn on "run tests"
                 if is_edit and self.tester.test_command:
                     logger.info("Post-edit auto-test running...")
+                    # Hard cap at 30s — npm test suites can block for 80+ seconds.
+                    # We want quick pass/fail signal, not full suite output.
+                    # tail -20 keeps the most relevant error lines.
                     _, test_out = self.docker.execute_command(
-                        f"cd {repo_dir} && {self.tester.test_command} 2>&1 | tail -30",
-                        timeout=90,
+                        f"cd {repo_dir} && timeout 25s {self.tester.test_command} 2>&1 | tail -20",
+                        timeout=30,
                     )
                     test_out_capped = self._cap_observation(test_out)
                     tests_run = True
@@ -450,7 +466,7 @@ class AgentLoop:
                 except Exception as e:
                     logger.error("QA LLM error: %s", e)
                     break
-                messages.append({"role": "assistant", "content": raw})
+                messages.append(self._assistant_msg(raw))
                 try:
                     _, atype, acontent = self.llm.parse_response(raw)
                 except Exception:

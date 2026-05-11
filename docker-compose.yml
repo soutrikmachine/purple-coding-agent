@@ -12,7 +12,7 @@ services:
       # ── LLM Provider ──────────────────────────────────────────────────────
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - LLM_BASE_URL=https://openrouter.ai/api/v1
-      - MODEL_NAME=google/gemini-3-flash-preview
+      - MODEL_NAME=minimax/minimax-m2.7
         # Verify exact slug at openrouter.ai/models — may be gemini-3-flash-preview
 
       # ── Server ────────────────────────────────────────────────────────────

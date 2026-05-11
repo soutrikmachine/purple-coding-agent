@@ -181,7 +181,7 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
                 r"-o -name '*.ts' -o -name '*.rb' -o -name '*.java' "
                 r"-o -name '*.rs' -o -name '*.kt' \) "
                 r"| grep -v -E '(node_modules|__pycache__|vendor|dist|build|\.git)' "
-                r"| head -120"
+                r"| head -250"
             ),
             30,
         )
@@ -193,7 +193,7 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
                 hyp_gen.generate_group(
                     problem_statement=problem_statement,
                     repo_skeleton=tree_output,
-                    g_size=2,
+                    g_size=3,
                     hints_text=hints_text,   # ← passed through now
                 ),
                 timeout=15.0,

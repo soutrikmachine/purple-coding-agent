@@ -1,14 +1,23 @@
 """
-LLMClient — Phase 2 v4.2.1
+LLMClient — Phase 2 v4.2.3
 
-Key fixes vs. submitted version:
-  - reasoning_content fallback: DeepSeek-v4-flash returns null content when
-    it enters reasoning mode — we now check reasoning_content as fallback
-  - Context pruning removed from here (AgentLoop._prune_context owns it)
-  - Provider routing: Parasail/NovitaAI for DeepSeek; auto-route for Gemini
-  - max_tokens reduced: 2048 (was 4096 — 4096 caused some providers to reject)
-  - stop tokens removed (caused premature truncation on multi-line diffs)
-  - Empty response retry: temperature nudge 0.15 → 0.4 (not 0.7 — too noisy)
+Supports three reasoning model families via OpenRouter:
+  - MiniMax  (minimax/minimax-m2.7)  : reasoning={"enabled": True}
+  - Gemini   (google/gemini-3-*)     : reasoning={"effort": "medium"}
+  - Claude   (anthropic/claude-*)    : reasoning={"effort": "medium"}
+
+All three return thinking in response.choices[0].message.reasoning_details
+(a list of dicts with "text" or "thinking" keys).
+
+MiniMax-specific: reasoning_details MUST be preserved and passed back in
+subsequent assistant messages for reasoning continuity across turns.
+This is handled by storing _last_reasoning_details after every call so
+agent_loop.py can include it in the messages list.
+
+REPL parser handles:
+  - Gemini's ```xml fence wrapping
+  - Typeless <action> tags (treats as bash)
+  - Inner ```bash code blocks (fallback)
 """
 
 import os
@@ -22,12 +31,10 @@ logger = logging.getLogger(__name__)
 
 
 class LLMClient:
+
     def __init__(self):
         self.base_url   = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-        # OpenRouter slug for Gemini 3 Flash Preview.
-        # Verify at: https://openrouter.ai/models — search "gemini"
-        # Common slugs: google/gemini-2.5-flash-preview or google/gemini-3-flash-preview
-        self.model_name = os.getenv("MODEL_NAME", "google/gemini-3-flash-preview")
+        self.model_name = os.getenv("MODEL_NAME", "minimax/minimax-m2.7")
         self.api_key    = (
             os.getenv("OPENROUTER_API_KEY")
             or os.getenv("LLM_API_KEY")
@@ -45,9 +52,21 @@ class LLMClient:
                 "X-Title": "Purple Agent Phase 2",
             },
         )
-        self._last_reasoning = ""   # populated after each Gemini call
+
+        # Detect model family
+        name = self.model_name.lower()
+        self.is_minimax = "minimax" in name
+        self.is_gemini  = "gemini"  in name
+        self.is_claude  = "claude"  in name or "anthropic" in name
+        self.is_thinking_model = self.is_minimax or self.is_gemini or self.is_claude
+
+        # Side-channel attributes populated after each call
+        self._last_reasoning         = ""   # text summary → written to NOTES.txt
+        self._last_reasoning_details = None # raw list → passed back for MiniMax continuity
+
         logger.info(
-            "LLMClient init: model=%s base_url=%s", self.model_name, self.base_url
+            "LLMClient init: model=%s thinking=%s",
+            self.model_name, self.is_thinking_model
         )
 
     async def generate_step(
@@ -56,102 +75,101 @@ class LLMClient:
         temperature: float = 0.15,
     ) -> str:
         """
-        Single LLM call with three layers of protection:
-        1. reasoning_content fallback  (DeepSeek null-content fix)
-        2. HTML/firewall detection     (Cloudflare leak guard)
-        3. Empty response retry        (nudge temperature, one retry)
+        Single LLM call with three protection layers:
+          1. Reasoning config injected per model family
+          2. HTML/Cloudflare firewall leak detection
+          3. Empty response retry with temperature nudge
         """
-        is_gemini = "gemini" in self.model_name.lower()
-
-        # Gemini 3 Flash Preview is only hosted by Google AI Platform on OpenRouter
-        # — there is exactly one provider, so no routing config is needed at all.
-        # extra_body / provider block removed entirely.
-        payload = {
+        payload: Dict = {
             "model":       self.model_name,
             "messages":    messages,
             "temperature": temperature,
-            "max_tokens":  2048,
-            # No stop tokens — they truncate multi-line patches mid-way
+            "max_tokens":  4096,   # must exceed thinking budget
         }
 
-        # Enable Gemini thinking explicitly via reasoning.effort
-        # Gemini 3 models use thinkingLevel (not thinkingBudget):
-        # OpenRouter maps effort 'low'/'medium'/'high' → Google thinkingLevel
-        # 'low' keeps latency reasonable for REPL tasks
-        if is_gemini:
-            # "reasoning" must go in extra_body — OpenAI SDK rejects it as top-level
-            payload["extra_body"] = {"reasoning": {"effort": "low"}}
+        # Inject reasoning — format differs by model family
+        if self.is_thinking_model:
+            if self.is_minimax:
+                # MiniMax uses a simple boolean enable
+                payload["extra_body"] = {"reasoning": {"enabled": True}}
+            else:
+                # Gemini 3 and Claude use effort levels (low/medium/high)
+                # "medium" gives meaningful thinking without excessive latency
+                payload["extra_body"] = {"reasoning": {"effort": "medium"}}
+
+        # Reset side-channel before call
+        self._last_reasoning         = ""
+        self._last_reasoning_details = None
 
         for attempt in range(1, 3):
             try:
                 response = await self.client.chat.completions.create(**payload)
-                msg = response.choices[0].message
+                msg      = response.choices[0].message
 
-                # Layer 1: Extract content + reasoning (Gemini-safe)
-                content = msg.content
+                # ── Extract content ───────────────────────────────────────────
+                content = msg.content or ""
 
-                # For Gemini via OpenRouter: thinking is in model_extra["reasoning"]
-                # NOT as a direct attribute — OpenAI SDK doesn't know about this field.
-                # getattr(msg, "reasoning_content", None) always returns None.
-                # The correct path is msg.model_extra.get("reasoning") or similar.
-                # For DeepSeek: never use this as content fallback (breaks REPL parser).
-                # OpenRouter returns Gemini thinking in msg.reasoning_details
-                # (a list of dicts with "text" or "thinking" keys).
-                # Falls back to model_extra and direct attribute for robustness.
-                reasoning = ""
-                if is_gemini:
+                # ── Extract reasoning_details ─────────────────────────────────
+                # OpenRouter normalises all thinking models to reasoning_details.
+                # MiniMax REQUIRES this to be preserved and passed back in the
+                # next turn's messages list — without it reasoning degrades.
+                reasoning_text    = ""
+                reasoning_details = None
+                if self.is_thinking_model:
                     try:
-                        # Primary: reasoning_details (OpenRouter standard)
                         rd = getattr(msg, "reasoning_details", None)
                         if rd and isinstance(rd, list):
-                            reasoning = " ".join(
+                            reasoning_details = rd
+                            reasoning_text = " ".join(
                                 item.get("text", "") or item.get("thinking", "")
-                                for item in rd if isinstance(item, dict)
+                                for item in rd
+                                if isinstance(item, dict)
                             ).strip()
-                        # Fallback: direct attribute
-                        if not reasoning:
-                            reasoning = getattr(msg, "reasoning", None) or ""
-                        # Last resort: model_extra
-                        if not reasoning:
+                        # Fallbacks for providers that surface it differently
+                        if not reasoning_text:
+                            reasoning_text = getattr(msg, "reasoning", None) or ""
+                        if not reasoning_text:
                             extra = getattr(msg, "model_extra", {}) or {}
                             rd2 = extra.get("reasoning_details") or extra.get("reasoning") or ""
                             if isinstance(rd2, list):
-                                reasoning = " ".join(
+                                reasoning_details = rd2
+                                reasoning_text = " ".join(
                                     str(r.get("text", "") or r.get("thinking", ""))
                                     for r in rd2
                                 )
                             else:
-                                reasoning = str(rd2)
-                    except Exception:
-                        reasoning = ""
+                                reasoning_text = str(rd2) if rd2 else ""
+                    except Exception as e:
+                        logger.debug("reasoning_details extraction error: %s", e)
 
-                # Layer 2: HTML/firewall leak detection
-                if content and ("<html" in content.lower() or "cloudflare" in content.lower()):
-                    logger.error("Provider returned HTML page instead of LLM text")
-                    raise ValueError("Provider HTML leak — retrying")
+                self._last_reasoning         = reasoning_text
+                self._last_reasoning_details = reasoning_details
 
-                # Layer 3: empty response retry
-                if not content or not content.strip():
+                logger.debug(
+                    "LLM: %d chars content, %d chars reasoning",
+                    len(content), len(reasoning_text)
+                )
+
+                # ── Firewall leak detection ────────────────────────────────────
+                if content and (
+                    "<html" in content.lower() or "cloudflare" in content.lower()
+                ):
+                    logger.error("Provider returned HTML/firewall page — retrying")
+                    raise ValueError("HTML firewall leak")
+
+                # ── Empty response retry ───────────────────────────────────────
+                if not content.strip():
                     if attempt == 1:
                         logger.warning("Empty response — retrying with higher temperature")
                         payload["temperature"] = min(temperature + 0.25, 0.6)
                         continue
-                    else:
-                        logger.error("Empty response after retry — giving up")
-                        return ""
+                    logger.error("Empty response after retry — giving up")
+                    return ""
 
-                logger.debug(
-                    "LLM response: %d chars (reasoning: %d chars)",
-                    len(content), len(reasoning)
-                )
-                # Store reasoning in a side-channel attribute the caller can read
-                # without it polluting the message history.
-                self._last_reasoning = reasoning
                 return content
 
             except Exception as e:
                 err = str(e)
-                # Sanitize huge HTML errors from being injected into context
                 if len(err) > 300 or "<html" in err.lower():
                     err = "Provider error (HTML/WAF). Try a shorter command."
                 logger.error("LLM attempt %d/2 failed: %s", attempt, err[:150])
@@ -161,11 +179,18 @@ class LLMClient:
 
         return ""
 
-    def parse_response(self, raw_text: str) -> tuple:
+    def parse_response(self, raw_text: str) -> Tuple[str, str, str]:
         """
         Extracts (thought, action_type, action_content) from LLM output.
-        Handles Gemini's outer ```xml fences and DeepSeek's inner ```bash blocks.
-        Always returns a valid triple - never raises.
+
+        Parsing order:
+          1. Strip outer ```xml fence (Gemini pattern)
+          2. Match typed  <action type="bash">...</action>
+          3. Match typeless <action>...</action> → treated as bash
+          4. Match inner ```bash block (DeepSeek fallback)
+          5. Return safe error echo
+
+        Always returns a valid triple — never raises.
         """
         if not raw_text or not raw_text.strip():
             return (
@@ -176,15 +201,13 @@ class LLMClient:
 
         import re as _re
 
-        # Gemini wraps its entire XML in ```xml ... ``` fences - strip them first
+        # Strip outer markdown fence (Gemini wraps entire XML in ```xml ... ```)
         text = raw_text.strip()
         fence = _re.match(
-            r"^```(?:xml|json|markdown)?\s*\n(.*?)\n?```\s*$",
-            text,
-            _re.DOTALL,
+            r"^```(?:xml|json|markdown)?\s*\n(.*?)\n?```\s*$", text, _re.DOTALL
         )
         if fence:
-            logger.debug("Stripped outer markdown fence from Gemini response")
+            logger.debug("Stripped outer markdown fence")
             text = fence.group(1).strip()
 
         thought = "No thought provided."
@@ -196,7 +219,7 @@ class LLMClient:
         if m:
             thought = m.group(1).strip()
 
-        # Extract <action type="...">
+        # Extract typed <action type="...">
         m = _re.search(
             r"<action\s+type=['\"]?(\w+)['\"]?>(.*?)</action>",
             text,
@@ -206,32 +229,31 @@ class LLMClient:
             action_type    = m.group(1).strip().lower()
             action_content = m.group(2).strip()
         else:
-            # Fallback 1: typeless <action> tag (model forgot type= attribute)
+            # Typeless <action> → bash
             m = _re.search(r"<action>(.*?)</action>", text, _re.DOTALL | _re.IGNORECASE)
             if m:
-                logger.warning("Typeless <action> tag — treating as bash")
+                logger.warning("Typeless <action> — treating as bash")
                 action_type    = "bash"
                 action_content = m.group(1).strip()
             else:
-                # Fallback 2: inner ```bash block (DeepSeek / non-compliant)
+                # Inner ```bash block (DeepSeek / non-compliant)
                 m = _re.search(r"```(?:bash|sh|python)\n(.*?)```", text, _re.DOTALL)
                 if m:
-                    logger.warning("Extracted action from inner markdown block (not XML)")
+                    logger.warning("Extracted action from inner markdown block")
                     action_type    = "bash"
                     action_content = m.group(1).strip()
                 else:
                     action_type    = "bash"
                     action_content = (
-                        "echo 'PARSE ERROR: No action tag found. "
-                        "Respond with <thought>...</thought><action type=\"bash\">cmd</action>. "
-                        "NO markdown fences.'"
+                        "echo 'PARSE ERROR: No action tag. "
+                        "Use <action type=\"bash\">cmd</action>. NO markdown fences.'"
                     )
-
 
         if action_type == "sh":
             action_type = "bash"
 
         return thought, action_type, action_content
+
     @staticmethod
     def format_observation(output: str, exit_code: int) -> str:
         status = "SUCCESS" if exit_code == 0 else f"FAILED (exit {exit_code})"

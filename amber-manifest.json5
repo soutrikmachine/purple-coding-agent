@@ -34,7 +34,7 @@
       "OPENROUTER_API_KEY": "${config.openrouter_key}",
       "GITHUB_TOKEN": "${config.github_token}",
       "LLM_BASE_URL": "https://openrouter.ai/api/v1",
-      "MODEL_NAME": "google/gemini-3-flash-preview",
+      "MODEL_NAME": "minimax/minimax-m2.7",
       "MAX_TURNS": "20",
       "TASK_TIMEOUT_S": "260",
       "MAX_OBS_CHARS": "1500"

@@ -18,13 +18,13 @@
 # Run (with external vLLM):
 #   docker run -p 9022:9022 \
 #     -e LLM_BASE_URL=http://your-vllm-host:8000 \
-#     -e MODEL_NAME=google/gemini-3-flash-preview \
+#     -e MODEL_NAME=minimax/minimax-m2.7 \
 #     purple-agent:latest
 #
 # Run (with local HuggingFace, requires GPU):
 #   docker run --gpus all -p 9022:9022 \
 #     -e LLM_BASE_URL=local \
-#     -e MODEL_NAME=google/gemini-3-flash-preview \
+#     -e MODEL_NAME=minimax/minimax-m2.7 \
 #     purple-agent:latest
 # =============================================================================
 
