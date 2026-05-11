@@ -221,7 +221,7 @@ class TestDockerBridge:
         bridge.container = MagicMock()
         bridge.container.id = "abc"
 
-        def fake_exec(cmd, timeout=10):
+        def fake_exec(cmd, timeout=10, workdir="/"):
             # Simulate: /testbed has .git, others don't
             if "test -d /testbed/.git" in cmd:
                 return (0, "GIT_FOUND")
@@ -243,7 +243,7 @@ class TestDockerBridge:
         bridge.container = MagicMock()
         bridge.container.id = "abc"
 
-        def fake_exec(cmd, timeout=10):
+        def fake_exec(cmd, timeout=10, workdir="/"):
             if "test -d " in cmd and "/.git" in cmd:
                 return (1, "")   # all known paths miss
             if "find / -maxdepth 4" in cmd:
@@ -266,7 +266,7 @@ class TestDockerBridge:
         bridge.container = MagicMock()
         bridge.container.id = "abc"
 
-        bridge.execute_command = lambda cmd, timeout=10: (1, "")
+        bridge.execute_command = lambda cmd, timeout=10, workdir="/": (1, "")
         result = bridge._detect_repo_dir()
         assert result == ""
 

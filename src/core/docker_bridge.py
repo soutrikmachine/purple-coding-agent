@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class DockerBridge:
     """Manages DooD (Docker-out-of-Docker) execution for SWE-Bench Pro."""
 
-    def __init__(self, image_name: str, base_commit: str = None, repo_dir: str = "/workspace"):
+    def __init__(self, image_name: str, base_commit: str = None, repo_dir: str = "/"):
         self.image_name  = image_name
         self.base_commit = base_commit
         self.repo_dir    = repo_dir
@@ -93,7 +93,7 @@ class DockerBridge:
             logger.error("Container creation failed: %s", e)
             return False
 
-    def execute_command(self, command: str, timeout: int = 120) -> tuple[int, str]:
+    def execute_command(self, command: str, timeout: int = 120, workdir: str = "") -> tuple[int, str]:
         """
         Executes a shell command inside the sibling container.
         SECRET 3: Uses subprocess CLI to bypass the Amber proxy EOF bug.
@@ -101,8 +101,12 @@ class DockerBridge:
         if not self.container:
             return -1, "Error: Container not running."
 
+        # Use explicit workdir if given, otherwise self.repo_dir.
+        # During _detect_repo_dir, workdir="/" is passed to avoid the
+        # chicken-and-egg: repo_dir defaults to "/" until detection runs.
+        effective_workdir = workdir if workdir else self.repo_dir
         docker_cmd = [
-            "docker", "exec", "-w", self.repo_dir, self.container.id,
+            "docker", "exec", "-w", effective_workdir, self.container.id,
             "timeout", "-k", "5", f"{timeout}s",
             "bash", "-c", command,
         ]
@@ -157,12 +161,14 @@ class DockerBridge:
           1. Check well-known paths first (fast, no find needed)
           2. Fall back to `find` for unusual layouts
         """
-        # Try well-known SWE-bench repo locations first
-        candidates = ["/testbed", "/app", "/repo", "/workspace", "/home/user/app",
-                      "/opt/app", "/srv", "/code"]
+        # Try well-known SWE-bench repo locations first.
+        # MUST pass workdir="/" — self.repo_dir is still "/" (default) at this
+        # point and the image may not have a /workspace dir at all.
+        candidates = ["/testbed", "/app", "/repo", "/home/user/app",
+                      "/opt/app", "/srv", "/code", "/workspace"]
         for path in candidates:
             ec, out = self.execute_command(
-                f"test -d {path}/.git && echo GIT_FOUND", timeout=5
+                f"test -d {path}/.git && echo GIT_FOUND", timeout=5, workdir="/"
             )
             if "GIT_FOUND" in out:
                 logger.info("Git repo found at known path: %s", path)
@@ -171,7 +177,7 @@ class DockerBridge:
         # Fall back: find the first .git directory anywhere (depth ≤ 4)
         ec, out = self.execute_command(
             "find / -maxdepth 4 -name '.git' -type d 2>/dev/null | head -1",
-            timeout=10,
+            timeout=10, workdir="/"
         )
         git_dir = out.strip()
         if git_dir:

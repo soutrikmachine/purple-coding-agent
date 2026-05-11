@@ -49,7 +49,7 @@ Green Agent (SWE-Bench Pro)
 │  Framework-specific rules + few-shot REPL examples          │
 ├─────────────────────────────────────────────────────────────┤
 │  Stage 4 — STATEFUL BASH REPL  (up to MAX_TURNS=20)        │
-│  3 tools injected into /workspace:                          │
+│  3 tools injected into /repo_dir():                          │
 │    • edit_file.py   — safe file editor (no sed)             │
 │    • ast_search.py  — grep-based function/class locator     │
 │    • run_script.sh  — discovered test command wrapper       │
