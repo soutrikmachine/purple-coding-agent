@@ -60,22 +60,30 @@ class DockerBridge:
             # No network_mode or environment override:
             # - Amber manages networking via overlay; host mode breaks isolation
             # - SWE-bench images are self-contained with their own runtimes
+            # Start with / as working dir so the container launches regardless
+            # of where the repo actually is — we detect it below.
             self.container = self.client.containers.create(
                 self.image_name,
                 detach=True,
                 entrypoint="/bin/bash",
                 command=["-c", "tail -f /dev/null"],
-                working_dir=self.repo_dir,
+                working_dir="/",
             )
             self.container.start()
             logger.info("Started sibling container: %s", self.container.short_id)
 
-            # SECRET 4: Clean slate checkout
-            if self.base_commit:
-                checkout_cmd = f"git checkout {self.base_commit} && git reset --hard {self.base_commit}"
-                ec, out = self.execute_command(checkout_cmd, timeout=30)
-                if ec != 0:
-                    logger.warning("git checkout failed (ec=%d): %s", ec, out[:200])
+            # ── CRITICAL: Auto-detect actual repo location ────────────────────
+            # SWE-bench images put the repo at varying paths:
+            #   /testbed  (Python repos), /app  (Node/JS repos),
+            #   /repo, /home/user/app, or even /  (root)
+            # We cannot hardcode /workspace — it may not be the git root.
+            detected = self._detect_repo_dir()
+            if detected:
+                self.repo_dir = detected
+                logger.info("Repo detected at: %s", self.repo_dir)
+            else:
+                logger.warning("Could not detect repo dir — falling back to /")
+                self.repo_dir = "/"
 
             # SECRET 7: Start background databases before the LLM takes over
             self._start_required_services()
@@ -134,6 +142,45 @@ class DockerBridge:
             except Exception as e:
                 logger.warning("Failed to cleanly remove container: %s", e)
             self.container = None
+
+    def _detect_repo_dir(self) -> str:
+        """
+        Auto-detect the git repository root inside the container.
+
+        SWE-bench images vary widely in where they place the repo:
+          /testbed  — most Python repos (pytest, requests, django, etc.)
+          /app      — Node.js repos (NodeBB, etc.)
+          /repo     — some Go repos
+          /         — occasionally the repo is at the filesystem root
+
+        Strategy:
+          1. Check well-known paths first (fast, no find needed)
+          2. Fall back to `find` for unusual layouts
+        """
+        # Try well-known SWE-bench repo locations first
+        candidates = ["/testbed", "/app", "/repo", "/workspace", "/home/user/app",
+                      "/opt/app", "/srv", "/code"]
+        for path in candidates:
+            ec, out = self.execute_command(
+                f"test -d {path}/.git && echo GIT_FOUND", timeout=5
+            )
+            if "GIT_FOUND" in out:
+                logger.info("Git repo found at known path: %s", path)
+                return path
+
+        # Fall back: find the first .git directory anywhere (depth ≤ 4)
+        ec, out = self.execute_command(
+            "find / -maxdepth 4 -name '.git' -type d 2>/dev/null | head -1",
+            timeout=10,
+        )
+        git_dir = out.strip()
+        if git_dir:
+            repo = git_dir[:-5] if git_dir.endswith("/.git") else git_dir.rsplit("/.git", 1)[0]
+            logger.info("Git repo found via find: %s", repo)
+            return repo or "/"
+
+        logger.warning("No .git directory found anywhere in container")
+        return ""
 
     def _start_required_services(self):
         """Heuristically detects and starts required background databases."""

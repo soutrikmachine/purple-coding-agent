@@ -32,8 +32,8 @@ Green Agent (SWE-Bench Pro)
 │  Pull SWE-bench Docker image → git checkout base_commit     │
 │  Auto-provision: Redis / MongoDB / PostgreSQL if detected   │
 ├─────────────────────────────────────────────────────────────┤
-│  Stage 1.5 — HYPOTHESIS SYNTHESIS  ★                        │
-│  find /workspace → file tree → LLM infers:                  │
+│  Stage 1.5 — HYPOTHESIS SYNTHESIS (Using GRPO)  ★                        │
+│  find /repo_dir → file tree → LLM infers:                  │
 │    • Which file/function is the likely bug site?            │
 │    • What bash command reproduces the failure?              │
 │    • What reasoning supports each hypothesis?               │

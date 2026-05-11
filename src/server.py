@@ -156,14 +156,20 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
 
         # Lightweight repo skeleton: just the file tree, no AST parsing at this stage
         # (ASTGraphBuilder is too slow for the pre-flight budget; agent uses it via bash)
+        # Use auto-detected repo_dir — NOT hardcoded /workspace
+        # DockerBridge._detect_repo_dir() sets this after container start
+        repo_root = docker.repo_dir
+        logger.info("Building file tree from repo root: %s", repo_root)
         _, tree_output = await asyncio.to_thread(
             docker.execute_command,
-            "find /workspace -type f \\( -name '*.py' -o -name '*.js' -o -name '*.go' "
-            "-o -name '*.ts' -o -name '*.rb' -o -name '*.java' \\) "
-            "| grep -v -E '(node_modules|__pycache__|vendor|dist|build|.git)' "
-            "| head -120",
+            (f"find {repo_root} -type f "
+             r"\( -name '*.py' -o -name '*.js' -o -name '*.go' "
+             r"-o -name '*.ts' -o -name '*.rb' -o -name '*.java' -o -name '*.rs' \) "
+             r"| grep -v -E '(node_modules|__pycache__|vendor|dist|build|\.git)' "
+             r"| head -120"),
             30,
         )
+        logger.info("File tree: %d files found", tree_output.count("\n") + (1 if tree_output.strip() else 0))
 
         try:
             hyps = await asyncio.wait_for(
@@ -201,11 +207,13 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
             gate_passed = await agent.run_stage_6_qa_phase(messages, max_qa_retries=2)
 
         # ── Always extract git diff (even on gate failure — partial credit) ──
+        # Extract final patch from detected repo root (not /workspace)
+        repo_root = docker.repo_dir
         _, patch = await asyncio.to_thread(
             docker.execute_command,
-            "git ls-files --others --exclude-standard "
-            "| grep -v -E '(__pycache__|\\.pyc$|\\.egg-info/)' "
-            "| xargs -r git add -N -- 2>/dev/null || true && git diff HEAD",
+            (f"cd {repo_root} && git ls-files --others --exclude-standard "
+             r"| grep -v -E '(__pycache__|\.pyc$|\.egg-info/)' "
+             r"| xargs -r git add -N -- 2>/dev/null || true && git diff HEAD"),
             30,
         )
         logger.info("Patch extracted: %d chars (gate_passed=%s)", len(patch), gate_passed)

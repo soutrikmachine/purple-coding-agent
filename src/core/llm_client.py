@@ -26,7 +26,7 @@ class LLMClient:
         self.base_url   = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
         # OpenRouter slug for Gemini 3 Flash Preview.
         # Verify at: https://openrouter.ai/models — search "gemini"
-        # Common slugs: google/gemini-3-flash-preview or google/gemini-3-flash-preview
+        # Common slugs: google/gemini-2.5-flash-preview or google/gemini-3-flash-preview
         self.model_name = os.getenv("MODEL_NAME", "google/gemini-3-flash-preview")
         self.api_key    = (
             os.getenv("OPENROUTER_API_KEY")
@@ -63,36 +63,15 @@ class LLMClient:
         """
         is_gemini = "gemini" in self.model_name.lower()
 
+        # Gemini 3 Flash Preview is only hosted by Google AI Platform on OpenRouter
+        # — there is exactly one provider, so no routing config is needed at all.
+        # extra_body / provider block removed entirely.
         payload = {
             "model":       self.model_name,
             "messages":    messages,
             "temperature": temperature,
             "max_tokens":  2048,
-            # NO stop tokens — they truncate multi-line patches mid-way
-            # Provider routing is model-family specific:
-            # - DeepSeek → Parasail/NovitaAI (dedicated, fastest path)
-            # - Gemini   → let OpenRouter auto-route to Google AI Platform
-            #              (Parasail/NovitaAI don't host Gemini; forcing them
-            #               adds 2–5s wasted fallback latency per turn)
-            "extra_body": {
-                "provider": (
-                    {
-                        "order":           ["Parasail", "NovitaAI"],
-                        "allow_fallbacks": True,
-                        "ignore":          ["AtlasCloud"],
-                    }
-                    if not is_gemini else
-                    {
-                        # No "order" — direct route to Google AI Platform
-                        "ignore": ["AtlasCloud"],
-                    }
-                ),
-                # NOTE: Do NOT pass thinking/budget_tokens for Gemini.
-                # Gemini 2.5/3 Flash thinks automatically — no explicit enable needed.
-                # {"thinking": ...} is the Anthropic Claude format; Gemini via
-                # OpenRouter ignores or rejects it. reasoning_content is populated
-                # automatically and captured via the side-channel in _last_reasoning.
-            },
+            # No stop tokens — they truncate multi-line patches mid-way
         }
 
         for attempt in range(1, 3):
@@ -103,14 +82,22 @@ class LLMClient:
                 # Layer 1: Extract content + reasoning (Gemini-safe)
                 content = msg.content
 
-                # For Gemini: reasoning_content holds chain-of-thought.
-                # We do NOT use it as a content replacement (it has no XML tags).
-                # Instead, return it as a side-channel so agent_loop can write
-                # it to NOTES.txt for long-term reasoning memory.
-                # For DeepSeek: DO NOT fall back to reasoning_content — it breaks REPL.
+                # For Gemini via OpenRouter: thinking is in model_extra["reasoning"]
+                # NOT as a direct attribute — OpenAI SDK doesn't know about this field.
+                # getattr(msg, "reasoning_content", None) always returns None.
+                # The correct path is msg.model_extra.get("reasoning") or similar.
+                # For DeepSeek: never use this as content fallback (breaks REPL parser).
                 reasoning = ""
                 if is_gemini:
-                    reasoning = getattr(msg, "reasoning_content", None) or ""
+                    try:
+                        extra = getattr(msg, "model_extra", {}) or {}
+                        reasoning = (
+                            extra.get("reasoning")
+                            or extra.get("reasoning_content")
+                            or ""
+                        )
+                    except Exception:
+                        reasoning = ""
 
                 # Layer 2: HTML/firewall leak detection
                 if content and ("<html" in content.lower() or "cloudflare" in content.lower()):

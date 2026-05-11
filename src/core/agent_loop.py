@@ -54,7 +54,7 @@ class AgentLoop:
 
         self.system_prompt = textwrap.dedent("""\
             You are Purple Agent, an expert software engineer in a stateful Bash REPL.
-            The repository is at /workspace. You have a STRICT budget of 20 shell calls.
+            The repository root is shown in the ENVIRONMENT block of the first message. You have a STRICT budget of 20 shell calls.
             A top-tier engineer solves SWE-bench tasks in 8-12 calls. Work efficiently.
 
             <protocol>
@@ -78,35 +78,36 @@ class AgentLoop:
 
             <memory_rules>
             Your context window is pruned to keep costs manageable.
-            TREAT /workspace/NOTES.txt AS YOUR PRIMARY EXTERNAL MEMORY.
+            TREAT {REPO_ROOT}/NOTES.txt AS YOUR PRIMARY EXTERNAL MEMORY.
+            (REPO_ROOT is shown in the ENVIRONMENT block — use the actual path, not /workspace)
             The framework automatically appends your bash outputs there,
             but you MUST prefix your thought with a summary line like:
               "Step N: [what I found / what I changed]"
             If you feel lost, your FIRST action must be:
-              cat /workspace/NOTES.txt
+              cat {repo_dir}/NOTES.txt
             </memory_rules>
 
             <tools>
             Two injected tools live at /workspace — use them:
 
             1. FILE EDITOR (avoids sed pitfalls):
-               python /workspace/edit_file.py "path/to/file" "exact old code" "new code"
+               python {repo_dir}/edit_file.py "path/to/file" "exact old code" "new code"
                'exact old code' must match CHARACTER-FOR-CHARACTER. Verify after:
                grep -n "new code" path/to/file
 
             2. AST SEARCH (finds definitions and call sites instantly):
-               python /workspace/ast_search.py "FunctionOrClassName"
+               python {repo_dir}/ast_search.py "FunctionOrClassName"
                Use this before blind grep when looking for where something is defined.
 
             3. TEST RUNNER:
-               bash /workspace/run_script.sh           ← full suite
+               bash {repo_dir}/run_script.sh           ← full suite
                pytest path/test.py::test_name -x --tb=short  ← targeted (preferred)
                go test -run TestName ./pkg/...          ← Go targeted
             </tools>
 
             <verification_rules>
             Before submitting:
-            1. Run bash /workspace/run_script.sh (or a targeted subset)
+            1. Run bash {repo_dir}/run_script.sh (or a targeted subset)
             2. Confirm fix passes and no regressions introduced
             3. Handle None/null, empty lists/dicts, boundary values
             A partial working fix is better than nothing — submit when stuck.
@@ -122,13 +123,17 @@ class AgentLoop:
 
     # ── Workspace bootstrap ────────────────────────────────────────────────────
 
-    def _bootstrap_workspace(self):
+    def _bootstrap_workspace(self, repo_dir: str):
         """
-        Inject three helper scripts into the sibling container:
+        Inject three helper scripts into the REPO directory (not hardcoded /workspace).
+        The repo_dir is auto-detected by DockerBridge._detect_repo_dir() and varies
+        per SWE-bench image: /testbed, /app, /repo, etc.
+
+        Tools written to {repo_dir}/:
           - edit_file.py  : safe file editor (avoids sed pitfalls)
           - ast_search.py : grep-based function/class locator (no tree-sitter needed)
           - run_script.sh : discovered test command wrapper
-        Also initialises /workspace/NOTES.txt as the agent scratchpad.
+          - NOTES.txt     : agent scratchpad (framework writes here each turn)
         """
         # ── 1. edit_file.py ───────────────────────────────────────────────────
         editor = (
@@ -142,7 +147,7 @@ class AgentLoop:
             "    print(f'ERROR: old_text not found in {f}. Check whitespace!')\n"
         )
         self.docker.execute_command(
-            f"cat > /workspace/edit_file.py << 'PYEOF'\n{editor}PYEOF"
+            f"cat > {repo_dir}/edit_file.py << 'PYEOF'\n{editor}PYEOF"
         )
 
         # ── 2. ast_search.py (grep-based, no tree-sitter dependency) ─────────
@@ -151,7 +156,7 @@ class AgentLoop:
         ast_search = (
             "import sys, subprocess\n"
             "if len(sys.argv) < 2:\n"
-            "    print('Usage: python /workspace/ast_search.py <Name>')\n"
+            "    print('Usage: python {repo_dir}/ast_search.py <Name>')\n"
             "    sys.exit(1)\n"
             "target = sys.argv[1]\n"
             "exts = ['*.py','*.go','*.js','*.ts','*.tsx','*.rb','*.java','*.rs','*.c','*.cpp']\n"
@@ -159,7 +164,7 @@ class AgentLoop:
             "# Pattern covers: def X, func X, class X, function X, fn X, method X\n"
             "pattern = rf'(def |func |class |function |fn |\btype ).*\\b{target}\\b'\n"
             "r = subprocess.run(['grep','-rn','-E',pattern,'.']+includes,\n"
-            "    capture_output=True, text=True, cwd='/workspace')\n"
+            "    capture_output=True, text=True, cwd='.')\n"
             "if r.stdout:\n"
             "    lines = r.stdout.strip().split('\\n')\n"
             "    print(f'Found {len(lines)} definition(s) of \'{target}\':\\n')\n"
@@ -168,7 +173,7 @@ class AgentLoop:
             "    # Fallback: any reference to the name\n"
             "    r2 = subprocess.run(['grep','-rn','--include=*.py','--include=*.go',\n"
             "        '--include=*.js','--include=*.ts',target,'.']+[],\n"
-            "        capture_output=True, text=True, cwd='/workspace')\n"
+            "        capture_output=True, text=True, cwd='.')\n"
             "    hits = r2.stdout.strip().split('\\n')[:20] if r2.stdout else []\n"
             "    if hits:\n"
             "        print(f'No definition found. References to \'{target}\':\\n')\n"
@@ -177,20 +182,20 @@ class AgentLoop:
             "        print(f'\'{target}\' not found anywhere in the repo.')\n"
         )
         self.docker.execute_command(
-            f"cat > /workspace/ast_search.py << 'PYEOF'\n{ast_search}PYEOF"
+            f"cat > {repo_dir}/ast_search.py << 'PYEOF'\n{ast_search}PYEOF"
         )
 
         # ── 3. run_script.sh (wraps the discovered test command) ─────────────
         test_cmd = self.tester.test_command or "echo 'No test runner discovered. Run tests manually.'"
         self.docker.execute_command(
-            f"printf '#!/bin/bash\\nset -e\\ncd /workspace\\n{test_cmd}\\n' "
-            "> /workspace/run_script.sh && chmod +x /workspace/run_script.sh"
+            f"printf '#!/bin/bash\\nset -e\\ncd {repo_dir}\\n{test_cmd}\\n' "
+            "> {repo_dir}/run_script.sh && chmod +x {repo_dir}/run_script.sh"
         )
 
         # ── 4. Initialise NOTES.txt scratchpad ────────────────────────────────
         self.docker.execute_command(
             "printf '### PURPLE AGENT NOTES ###\\n- Start of exploration.\\n"
-            "- Test runner: " + test_cmd[:80] + "\\n' > /workspace/NOTES.txt"
+            "- Test runner: " + test_cmd[:80] + "\\n' > {repo_dir}/NOTES.txt"
         )
 
     # ── Observation handling ───────────────────────────────────────────────────
@@ -208,13 +213,13 @@ class AgentLoop:
             + output[-half:]
         )
 
-    def _append_to_notes(self, turn: int, command: str, output: str):
+    def _append_to_notes(self, repo_dir: str, turn: int, command: str, output: str):
         """Auto-write a summary line to NOTES.txt after every bash exec."""
         # First 200 chars of output — enough to capture errors or key values
         summary = output.strip()[:200].replace("'", "'\\''")
         note = f"Turn {turn}: $ {command[:80]}\\n  → {summary}"
         self.docker.execute_command(
-            f"printf '\\n{note}\\n' >> /workspace/NOTES.txt 2>/dev/null || true"
+            f"printf '\\n{note}\\n' >> {repo_dir}/NOTES.txt 2>/dev/null || true"
         )
 
     # ── Context window management ──────────────────────────────────────────────
@@ -275,16 +280,23 @@ class AgentLoop:
         context_primer: str,
     ) -> Tuple[bool, List[Dict]]:
 
-        self._bootstrap_workspace()
+        repo_dir = self.docker.repo_dir
+        self._bootstrap_workspace(repo_dir)
 
         messages: List[Dict] = [
             {"role": "system", "content": self.system_prompt},
             {
                 "role": "user",
                 "content": (
+                    f"### ENVIRONMENT\n"
+                    f"Repository root: `{repo_dir}`\n"
+                    f"All source files, tests, and your tools (edit_file.py, "
+                    f"ast_search.py, run_script.sh, NOTES.txt) are inside `{repo_dir}`.\n"
+                    f"When the system prompt says '/workspace', substitute `{repo_dir}`.\n\n"
                     f"### TARGET ISSUE\n{issue_text}\n\n"
                     f"{context_primer}\n\n"
-                    "Begin by verifying the issue exists, then locate and fix it."
+                    f"Start in `{repo_dir}`. Begin by verifying the issue exists, "
+                    "then locate and fix it."
                 ),
             },
         ]
@@ -297,7 +309,7 @@ class AgentLoop:
             # Force-submit on final turn: extract diff and terminate
             if turn == FORCE_SUBMIT:
                 logger.warning("Turn budget exhausted. Force-extracting git diff.")
-                _, diff = self.docker.execute_command("git diff HEAD", timeout=20)
+                _, diff = self.docker.execute_command(f"cd {repo_dir} && git diff HEAD", timeout=20)
                 if diff.strip():
                     logger.info("Force-submit: diff has %d chars", len(diff))
                 else:
@@ -333,7 +345,7 @@ class AgentLoop:
                 summary = reasoning[:400].replace("'", " ").replace('"', " ").replace("\n", " ")
                 self.docker.execute_command(
                     f"printf '\n[Turn {turn} thinking]: {summary}\n' "
-                    ">> /workspace/NOTES.txt 2>/dev/null || true",
+                    ">> {repo_dir}/NOTES.txt 2>/dev/null || true",
                     timeout=5,
                 )
 
@@ -367,7 +379,7 @@ class AgentLoop:
                 output_capped = self._cap_observation(output)
 
                 # Auto-write to NOTES.txt (framework-level memory, not agent-level)
-                self._append_to_notes(turn, action_content, output)
+                self._append_to_notes(repo_dir, turn, action_content, output)
 
                 # Periodic diff snapshot every 4 turns (or after any edit)
                 # This ensures the global timeout handler in server.py can always
@@ -376,7 +388,7 @@ class AgentLoop:
                               ["edit_file.py", "git apply", ">", ">>", "tee ", "patch "])
                 if turn % 4 == 0 or is_edit:
                     self.docker.execute_command(
-                        "git diff HEAD > /tmp/purple_patch.diff 2>/dev/null || true",
+                        f"cd {repo_dir} && git diff HEAD > /tmp/purple_patch.diff 2>/dev/null || true",
                         timeout=10,
                     )
 
