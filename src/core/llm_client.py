@@ -79,7 +79,8 @@ class LLMClient:
         # OpenRouter maps effort 'low'/'medium'/'high' → Google thinkingLevel
         # 'low' keeps latency reasonable for REPL tasks
         if is_gemini:
-            payload["reasoning"] = {"effort": "low"}
+            # "reasoning" must go in extra_body — OpenAI SDK rejects it as top-level
+            payload["extra_body"] = {"reasoning": {"effort": "low"}}
 
         for attempt in range(1, 3):
             try:
