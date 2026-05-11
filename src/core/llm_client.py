@@ -73,6 +73,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.15,
+        use_thinking: bool = True,
     ) -> str:
         """
         Single LLM call with three protection layers:
@@ -88,7 +89,7 @@ class LLMClient:
         }
 
         # Inject reasoning — format differs by model family
-        if self.is_thinking_model:
+        if self.is_thinking_model and use_thinking:
             if self.is_minimax:
                 # MiniMax uses a simple boolean enable
                 payload["extra_body"] = {"reasoning": {"enabled": True}}

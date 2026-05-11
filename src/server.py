@@ -198,7 +198,7 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
                     docker=docker,           # ← GSRM: execute verify_cmds for reward scoring
                     repo_dir=repo_root,      # ← GSRM: repo root path inside container
                 ),
-                timeout=90.0,               # increased: 3 verify_cmds × 20s each + LLM call
+                timeout=60.0,               # increased: 3 verify_cmds × 20s each + LLM call
             )
             logger.info("Hypotheses generated: %d", len(hyps))
         except asyncio.TimeoutError:
