@@ -183,6 +183,94 @@ class TestDockerBridge:
         assert "ERROR: something failed" in output
 
     @patch("docker.from_env")
+    def test_execute_command_uses_repo_dir_as_workdir(self, mock_docker):
+        """
+        execute_command passes -w self.repo_dir to docker exec.
+        After _detect_repo_dir() runs, this will be /testbed or /app, not /workspace.
+        This test verifies the -w flag is dynamic, not hardcoded.
+        """
+        from core.docker_bridge import DockerBridge
+
+        bridge = DockerBridge(image_name="test-image")
+        bridge.container = MagicMock()
+        bridge.container.id = "abc"
+        bridge.repo_dir = "/testbed"   # simulate post-detection state
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = b"ok"
+        mock_result.stderr = b""
+
+        with patch("subprocess.run", return_value=mock_result) as mock_sub:
+            bridge.execute_command("ls")
+
+        cmd_args = mock_sub.call_args[0][0]
+        assert "-w" in cmd_args
+        wi = cmd_args.index("-w")
+        assert cmd_args[wi + 1] == "/testbed"   # NOT hardcoded /workspace
+
+    @patch("docker.from_env")
+    def test_detect_repo_dir_finds_known_path(self, mock_docker):
+        """
+        _detect_repo_dir() probes well-known paths first.
+        If /testbed contains .git it is returned without running find.
+        """
+        from core.docker_bridge import DockerBridge
+
+        bridge = DockerBridge(image_name="test-image")
+        bridge.container = MagicMock()
+        bridge.container.id = "abc"
+
+        def fake_exec(cmd, timeout=10):
+            # Simulate: /testbed has .git, others don't
+            if "test -d /testbed/.git" in cmd:
+                return (0, "GIT_FOUND")
+            return (1, "")
+
+        bridge.execute_command = fake_exec
+        result = bridge._detect_repo_dir()
+        assert result == "/testbed"
+
+    @patch("docker.from_env")
+    def test_detect_repo_dir_falls_back_to_find(self, mock_docker):
+        """
+        _detect_repo_dir() falls back to `find` if no known path has .git.
+        Covers repos at unusual locations like /home/user/project.
+        """
+        from core.docker_bridge import DockerBridge
+
+        bridge = DockerBridge(image_name="test-image")
+        bridge.container = MagicMock()
+        bridge.container.id = "abc"
+
+        def fake_exec(cmd, timeout=10):
+            if "test -d " in cmd and "/.git" in cmd:
+                return (1, "")   # all known paths miss
+            if "find / -maxdepth 4" in cmd:
+                return (0, "/home/user/project/.git\n")
+            return (1, "")
+
+        bridge.execute_command = fake_exec
+        result = bridge._detect_repo_dir()
+        assert result == "/home/user/project"
+
+    @patch("docker.from_env")
+    def test_detect_repo_dir_returns_empty_on_total_miss(self, mock_docker):
+        """
+        _detect_repo_dir() returns empty string (not a crash) if no repo found.
+        start_container() will then fall back to '/'.
+        """
+        from core.docker_bridge import DockerBridge
+
+        bridge = DockerBridge(image_name="test-image")
+        bridge.container = MagicMock()
+        bridge.container.id = "abc"
+
+        bridge.execute_command = lambda cmd, timeout=10: (1, "")
+        result = bridge._detect_repo_dir()
+        assert result == ""
+
+    @patch("docker.from_env")
     def test_docker_client_init_failure_is_graceful(self, mock_docker):
         """Missing Docker socket produces a clean error, not a crash."""
         mock_docker.side_effect = Exception("Cannot connect to Docker daemon")
@@ -309,7 +397,7 @@ class TestASTGraph:
 
         with patch.object(ASTGraphBuilder, "__init__", return_value=None):
             builder = ASTGraphBuilder.__new__(ASTGraphBuilder)
-            builder.repo_path = "/workspace"
+            builder.repo_path = "/testbed"   # realistic SWE-bench path, not /workspace
             # Minimal stub attributes the methods need
             builder.PY_LANGUAGE = MagicMock()
             builder.JS_LANGUAGE = MagicMock()
@@ -323,8 +411,8 @@ class TestASTGraph:
     def test_repo_skeleton_generation(self, mock_walk):
         """Structural map is generated and contains expected entries."""
         mock_walk.return_value = [
-            ("/workspace",       ["src"], ["README.md"]),
-            ("/workspace/src",   [],      ["core.py"]),
+            ("/testbed",       ["src"], ["README.md"]),
+            ("/testbed/src",   [],      ["core.py"]),
         ]
 
         builder = self._make_builder()
@@ -336,7 +424,7 @@ class TestASTGraph:
         ):
             graph = builder.build_repo_graph()
 
-        assert "File: `src/core.py`" in graph
+        assert "File: `src/core.py`" in graph  # relative to repo_path=/testbed
         assert "Agent" in graph
         assert "run" in graph
 
@@ -344,9 +432,9 @@ class TestASTGraph:
     def test_vendor_dirs_excluded(self, mock_walk):
         """node_modules, vendor, __pycache__ are excluded from the graph."""
         mock_walk.return_value = [
-            ("/workspace",                  ["node_modules", "src"], []),
-            ("/workspace/node_modules",     [],                      ["index.js"]),
-            ("/workspace/src",              [],                      ["app.py"]),
+            ("/testbed",                  ["node_modules", "src"], []),
+            ("/testbed/node_modules",     [],                      ["index.js"]),
+            ("/testbed/src",              [],                      ["app.py"]),
         ]
 
         builder = self._make_builder()
