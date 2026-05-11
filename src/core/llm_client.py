@@ -74,6 +74,13 @@ class LLMClient:
             # No stop tokens — they truncate multi-line patches mid-way
         }
 
+        # Enable Gemini thinking explicitly via reasoning.effort
+        # Gemini 3 models use thinkingLevel (not thinkingBudget):
+        # OpenRouter maps effort 'low'/'medium'/'high' → Google thinkingLevel
+        # 'low' keeps latency reasonable for REPL tasks
+        if is_gemini:
+            payload["reasoning"] = {"effort": "low"}
+
         for attempt in range(1, 3):
             try:
                 response = await self.client.chat.completions.create(**payload)
@@ -87,15 +94,33 @@ class LLMClient:
                 # getattr(msg, "reasoning_content", None) always returns None.
                 # The correct path is msg.model_extra.get("reasoning") or similar.
                 # For DeepSeek: never use this as content fallback (breaks REPL parser).
+                # OpenRouter returns Gemini thinking in msg.reasoning_details
+                # (a list of dicts with "text" or "thinking" keys).
+                # Falls back to model_extra and direct attribute for robustness.
                 reasoning = ""
                 if is_gemini:
                     try:
-                        extra = getattr(msg, "model_extra", {}) or {}
-                        reasoning = (
-                            extra.get("reasoning")
-                            or extra.get("reasoning_content")
-                            or ""
-                        )
+                        # Primary: reasoning_details (OpenRouter standard)
+                        rd = getattr(msg, "reasoning_details", None)
+                        if rd and isinstance(rd, list):
+                            reasoning = " ".join(
+                                item.get("text", "") or item.get("thinking", "")
+                                for item in rd if isinstance(item, dict)
+                            ).strip()
+                        # Fallback: direct attribute
+                        if not reasoning:
+                            reasoning = getattr(msg, "reasoning", None) or ""
+                        # Last resort: model_extra
+                        if not reasoning:
+                            extra = getattr(msg, "model_extra", {}) or {}
+                            rd2 = extra.get("reasoning_details") or extra.get("reasoning") or ""
+                            if isinstance(rd2, list):
+                                reasoning = " ".join(
+                                    str(r.get("text", "") or r.get("thinking", ""))
+                                    for r in rd2
+                                )
+                            else:
+                                reasoning = str(rd2)
                     except Exception:
                         reasoning = ""
 

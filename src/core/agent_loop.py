@@ -196,22 +196,22 @@ class AgentLoop:
             return {
                 "role": "user",
                 "content": (
-                    f"<observation status=\"SYSTEM\">"
+                    f"<observation status='SYSTEM'>"
                     f"WARNING: TURN {turn}/{MAX_TURNS}. {remaining} turns left. "
                     f"Run: cat {repo_dir}/NOTES.txt to review what you tried. "
                     f"Stop broad exploration. Locate the bug and edit now."
-                    f"</observation>"
+                    "</observation>"
                 ),
             }
         if turn == alert:
             return {
                 "role": "user",
                 "content": (
-                    f"<observation status=\"SYSTEM\">"
+                    f"<observation status='SYSTEM'>"
                     f"CRITICAL: TURN {turn}/{MAX_TURNS}. {remaining} turns left. "
                     f"Use {repo_dir}/edit_file.py to make your edit and submit NOW. "
                     f"A partial fix beats no fix."
-                    f"</observation>"
+                    "</observation>"
                 ),
             }
         return None
@@ -220,6 +220,7 @@ class AgentLoop:
         self,
         issue_text: str,
         context_primer: str,
+        verify_cmd: str = "",    # top hypothesis verify_cmd — run before turn 1
     ) -> Tuple[bool, List[Dict]]:
 
         repo_dir = self.docker.repo_dir
@@ -242,6 +243,32 @@ class AgentLoop:
                 ),
             },
         ]
+
+        # ── Pre-loop: auto-run the top hypothesis verify_cmd ─────────────────
+        # This gives the model real test output on turn 1 without burning a turn.
+        # The agent enters the loop already knowing whether the bug reproduces.
+        tests_run = False
+        if verify_cmd and verify_cmd.strip():
+            logger.info("Pre-loop: running verify_cmd: %s", verify_cmd[:80])
+            ec, out = self.docker.execute_command(
+                f"cd {repo_dir} && {verify_cmd}", timeout=60
+            )
+            out_capped = self._cap_observation(out)
+            pre_obs = self.llm.format_observation(out_capped, ec)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "<observation status='PRE_LOOP'>"
+                    "Framework ran the hypothesis verify command before your first turn:\n"
+                    f"`{verify_cmd}`\n\n"
+                    f"{out_capped}\n"
+                    f"(exit code: {ec})\n"
+                    "Use this output to guide your approach."
+                    "</observation>"
+                ),
+            })
+            tests_run = ec == 0
+            logger.info("Pre-loop verify_cmd: exit=%d out=%d chars", ec, len(out))
 
         logger.info("Stage 4: starting %d-turn REPL (repo_dir=%s)", MAX_TURNS, repo_dir)
 
@@ -270,7 +297,7 @@ class AgentLoop:
                 logger.error("LLM error turn %d: %s", turn, str(e)[:150])
                 messages.append({
                     "role": "user",
-                    "content": f"<observation status=\"FAILED\">LLM error: {str(e)[:200]}</observation>",
+                    "content": f"<observation status='FAILED'>LLM error: {str(e)[:200]}</observation>",
                 })
                 continue
 
@@ -300,12 +327,32 @@ class AgentLoop:
             if not action_type:
                 messages.append({
                     "role": "user",
-                    "content": "<observation status=\"FAILED\">Missing action tag.</observation>",
+                    "content": "<observation status='FAILED'>Missing action tag.</observation>",
                 })
                 continue
 
             if action_type == "submit":
-                logger.info("Agent submitted on turn %d", turn)
+                # Reject early submits that skip testing — the model tends to
+                # submit immediately after reading the hypothesis without verifying.
+                MIN_TURNS_BEFORE_SUBMIT = 4
+                if turn < MIN_TURNS_BEFORE_SUBMIT and not tests_run:
+                    logger.warning(
+                        "Submit REJECTED at turn %d — agent hasn't run any tests yet",
+                        turn,
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "<observation status='REJECTED'>"
+                            f"Submit rejected at turn {turn}/{MAX_TURNS}. "
+                            "You MUST verify your fix before submitting. "
+                            f"Run: bash {repo_dir}/run_script.sh "
+                            "or a targeted test. Confirm the test PASSES."
+                            "</observation>"
+                        ),
+                    })
+                    continue
+                logger.info("Agent submitted on turn %d (tests_run=%s)", turn, tests_run)
                 return True, messages
 
             if action_type == "bash":
@@ -313,9 +360,45 @@ class AgentLoop:
                 output_capped = self._cap_observation(output)
                 self._append_to_notes(repo_dir, turn, action_content, output)
 
+                # Track whether the agent has run any test command
+                is_test_cmd = any(kw in action_content for kw in
+                                  ["pytest", "npm test", "go test", "run_script.sh",
+                                   "python -m pytest", "cargo test", "rspec", "jest"])
+                if is_test_cmd:
+                    tests_run = True
+
                 is_edit = any(kw in action_content for kw in
                               ["edit_file.py", "git apply", "tee ", "patch "])
-                if turn % 4 == 0 or is_edit:
+
+                # After an edit: auto-run targeted test as framework observation
+                # This gives real feedback without burning a model turn on "run tests"
+                if is_edit and self.tester.test_command:
+                    logger.info("Post-edit auto-test running...")
+                    _, test_out = self.docker.execute_command(
+                        f"cd {repo_dir} && {self.tester.test_command} 2>&1 | tail -30",
+                        timeout=90,
+                    )
+                    test_out_capped = self._cap_observation(test_out)
+                    tests_run = True
+                    messages.append({"role": "user", "content": self.llm.format_observation(output_capped, exit_code)})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "<observation status='AUTO_TEST'>"
+                            f"Framework auto-ran tests after your edit:\n"
+                            f"`{self.tester.test_command}`\n\n"
+                            f"{test_out_capped}"
+                            "</observation>"
+                        ),
+                    })
+                    # Snapshot diff after edit+test
+                    self.docker.execute_command(
+                        f"cd {repo_dir} && git diff HEAD > /tmp/purple_patch.diff 2>/dev/null || true",
+                        timeout=10,
+                    )
+                    continue
+
+                if turn % 4 == 0:
                     self.docker.execute_command(
                         f"cd {repo_dir} && git diff HEAD > /tmp/purple_patch.diff 2>/dev/null || true",
                         timeout=10,
@@ -325,7 +408,7 @@ class AgentLoop:
             else:
                 messages.append({
                     "role": "user",
-                    "content": f"<observation status=\"FAILED\">Unknown action '{action_type}'. Use bash or submit.</observation>",
+                    "content": f"<observation status='FAILED'>Unknown action '{action_type}'. Use bash or submit.</observation>",
                 })
 
         return True, messages

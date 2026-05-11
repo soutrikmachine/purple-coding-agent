@@ -226,9 +226,11 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
         context_primer = icl_block + "\n" + hyp_block + test_hint + hints_primer
 
         # ── Stage 4: 20-turn bash REPL ────────────────────────────────────────
+        # Pass top hypothesis verify_cmd so framework auto-runs it before turn 1
+        verify_cmd = hyps[0].get("verify_cmd", "") if hyps else ""
         agent = AgentLoop(llm, docker, tester)
         _success, messages = await agent.run_stage_4_bash_repl(
-            problem_statement, context_primer
+            problem_statement, context_primer, verify_cmd=verify_cmd
         )
 
         # ── Stage 5: Mechanical test gate ─────────────────────────────────────
