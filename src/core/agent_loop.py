@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 import os as _os
 
-MAX_TURNS     = int(_os.getenv("MAX_TURNS",     "20"))
+MAX_TURNS     = int(_os.getenv("MAX_TURNS",     "14"))
 MAX_OBS_CHARS = int(_os.getenv("MAX_OBS_CHARS", "1500"))
 CONTEXT_KEEP  = int(_os.getenv("CONTEXT_KEEP",  "8"))
 

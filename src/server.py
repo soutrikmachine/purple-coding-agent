@@ -51,7 +51,7 @@ AGENT_CARD = {
         "20-turn budget with mechanical test gate."
     ),
     "url":     f"http://localhost:{PORT}/",
-    "version": "4.2.2",
+    "version": "4.2.3",
     "capabilities": {
         "streaming":              False,
         "pushNotifications":      False,
@@ -81,7 +81,7 @@ async def agent_card_compat():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "4.2.2"}
+    return {"status": "ok", "version": "4.2.3"}
 
 
 # ==============================================================================
@@ -181,7 +181,7 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
                 r"-o -name '*.ts' -o -name '*.rb' -o -name '*.java' "
                 r"-o -name '*.rs' -o -name '*.kt' \) "
                 r"| grep -v -E '(node_modules|__pycache__|vendor|dist|build|\.git)' "
-                r"| head -250"
+                r"| head -120"
             ),
             30,
         )
@@ -194,9 +194,11 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
                     problem_statement=problem_statement,
                     repo_skeleton=tree_output,
                     g_size=3,
-                    hints_text=hints_text,   # ← passed through now
+                    hints_text=hints_text,
+                    docker=docker,           # ← GSRM: execute verify_cmds for reward scoring
+                    repo_dir=repo_root,      # ← GSRM: repo root path inside container
                 ),
-                timeout=15.0,
+                timeout=90.0,               # increased: 3 verify_cmds × 20s each + LLM call
             )
             logger.info("Hypotheses generated: %d", len(hyps))
         except asyncio.TimeoutError:
