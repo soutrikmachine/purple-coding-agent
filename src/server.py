@@ -1,17 +1,19 @@
 """
-Purple Agent v4.2.2 — Phase 2 server
+Purple Agent v4.2.4 — Phase 2 server
 
 Pipeline:
   Stage 1   — Container bootstrap + repo detection
-  Stage 2   — Test command discovery (no execution — avoids 3-4 min stalls)
-  Stage 1.5 — Hypothesis generation (problem_statement + hints_text + file tree)
+  Stage 2   — Test command discovery (no execution)
+  Stage 1.5 — GSRM hypothesis generation (group sampling + execution reward scoring)
   Stage 3   — ICL injection
-  Stage 4   — 20-turn stateful bash REPL
+  Stage 4   — Stateful bash REPL (MAX_TURNS, default 30)
   Stage 5   — Mechanical test gate
   Stage 6   — Targeted QA repair (up to 2 retries)
 
-Global 260s asyncio.wait_for wraps the entire pipeline.
-Best-effort patch written to /tmp/purple_patch.diff periodically for timeout recovery.
+Patch extraction: git --no-pager diff HEAD --text
+  Simple and correct — no staging of untracked files.
+  Avoids the 6MB patch bug caused by git add -N staging
+  node_modules, injected tools, and build artifacts.
 """
 
 import os
@@ -39,19 +41,16 @@ logger = logging.getLogger("purple_agent")
 PORT                = int(os.getenv("PORT",          "9022"))
 GLOBAL_TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_S", "260"))
 
-# ── Agent card ─────────────────────────────────────────────────────────────────
-
 app = FastAPI(title="Purple Coding Agent (Phase 2)")
 
 AGENT_CARD = {
     "name":        "Purple Coding Agent",
     "description": (
         "SWE-bench Phase 2: Stateful Bash REPL + Docker-out-of-Docker. "
-        "Hypothesis synthesis from problem_statement + hints_text. "
-        "20-turn budget with mechanical test gate."
+        "GSRM hypothesis synthesis. 30-turn budget with mechanical test gate."
     ),
     "url":     f"http://localhost:{PORT}/",
-    "version": "4.2.3",
+    "version": "4.2.4",
     "capabilities": {
         "streaming":              False,
         "pushNotifications":      False,
@@ -62,7 +61,7 @@ AGENT_CARD = {
     "skills": [{
         "id":          "swe_patch",
         "name":        "SWE Patch",
-        "description": "Bash REPL with live test execution and verified diff output.",
+        "description": "Bash REPL with GSRM hypothesis scoring and verified diff output.",
         "tags":        ["coding", "swe-bench", "patch", "docker"],
         "examples":    [],
     }],
@@ -81,24 +80,16 @@ async def agent_card_compat():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "4.2.3"}
+    return {"status": "ok", "version": "4.2.4"}
 
 
 # ==============================================================================
 # TASK EXTRACTION
-# Handles all A2A envelope formats sent by the green agent.
-# Extracts ALL fields from instances.jsonl, including hints_text.
 # ==============================================================================
 
 def _extract_task(body: dict) -> tuple[dict, str]:
-    """
-    Parse the A2A JSON-RPC envelope and return (task_data, context_id).
-    task_data includes: problem_statement, repo, docker_image, base_commit,
-                        hints_text, instance_id, short_id
-    """
     context_id = ""
 
-    # Flat body (problem_statement at top level)
     if "problem_statement" in body:
         return body, context_id
 
@@ -111,11 +102,9 @@ def _extract_task(body: dict) -> tuple[dict, str]:
             kind = part.get("kind") or part.get("type", "")
             text = part.get("text", "")
 
-            # Structured data part
             if kind == "data" and "problem_statement" in part.get("data", {}):
                 return part["data"], context_id
 
-            # JSON-in-text part
             if kind == "text" and text.strip():
                 try:
                     parsed = json.loads(text)
@@ -136,15 +125,10 @@ def _extract_task(body: dict) -> tuple[dict, str]:
 # ==============================================================================
 
 async def _run_task(task_data: dict, llm: LLMClient) -> str:
-    """
-    Full pipeline — always returns a unified diff (may be empty).
-    Designed to complete in ≤ 260s.
-    """
     problem_statement = task_data.get("problem_statement", "")
-    hints_text        = task_data.get("hints_text", "")        # ← from instances.jsonl
+    hints_text        = task_data.get("hints_text", "")
     image_name        = task_data.get("docker_image", "")
     base_commit       = task_data.get("base_commit", "HEAD")
-    repo              = task_data.get("repo", "")
     instance_id       = task_data.get("instance_id", "")
 
     if hints_text:
@@ -167,7 +151,7 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
         await asyncio.to_thread(tester.discover_test_command_only)
         logger.info("Test command discovered: %s", tester.test_command or "none")
 
-        # ── Stage 1.5: File tree + hypothesis generation ──────────────────────
+        # ── Stage 1.5: File tree + GSRM hypothesis generation ────────────────
         icl     = ICLSpecialist()
         hyp_gen = HypothesisGenerator(llm)
 
@@ -181,7 +165,7 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
                 r"-o -name '*.ts' -o -name '*.rb' -o -name '*.java' "
                 r"-o -name '*.rs' -o -name '*.kt' \) "
                 r"| grep -v -E '(node_modules|__pycache__|vendor|dist|build|\.git)' "
-                r"| head -120"
+                r"| head -250"
             ),
             30,
         )
@@ -195,10 +179,10 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
                     repo_skeleton=tree_output,
                     g_size=3,
                     hints_text=hints_text,
-                    docker=docker,           # ← GSRM: execute verify_cmds for reward scoring
-                    repo_dir=repo_root,      # ← GSRM: repo root path inside container
+                    docker=docker,
+                    repo_dir=repo_root,
                 ),
-                timeout=60.0,               # increased: 3 verify_cmds × 20s each + LLM call
+                timeout=90.0,
             )
             logger.info("Hypotheses generated: %d", len(hyps))
         except asyncio.TimeoutError:
@@ -212,23 +196,18 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
             f"\n## Test Command\n`{tester.test_command}`\n"
             "Run this to check your fix. Use targeted test invocation when possible.\n"
             if tester.test_command else
-            "\n## Test Command\n"
-            "No standard test runner detected. Explore manually and use `git diff` "
-            "to confirm changes are correct.\n"
+            "\n## Test Command\nNo standard test runner detected.\n"
         )
-        # Also inject hints_text directly into primer if non-empty
         hints_primer = ""
         if hints_text and hints_text.strip():
             hints_primer = (
-                f"\n## Benchmark Hints\n"
-                f"{hints_text.strip()}\n"
-                "(These hints are from the benchmark annotators — use them to narrow your search)\n"
+                f"\n## Benchmark Hints\n{hints_text.strip()}\n"
+                "(From benchmark annotators — use to narrow your search)\n"
             )
 
         context_primer = icl_block + "\n" + hyp_block + test_hint + hints_primer
 
-        # ── Stage 4: 20-turn bash REPL ────────────────────────────────────────
-        # Pass top hypothesis verify_cmd so framework auto-runs it before turn 1
+        # ── Stage 4: Bash REPL ────────────────────────────────────────────────
         verify_cmd = hyps[0].get("verify_cmd", "") if hyps else ""
         agent = AgentLoop(llm, docker, tester)
         _success, messages = await agent.run_stage_4_bash_repl(
@@ -244,21 +223,18 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
             logger.warning("Gate failed. Entering QA phase.")
             gate_passed = await agent.run_stage_6_qa_phase(messages, max_qa_retries=2)
 
-        # ── Always extract git diff (partial credit on gate failure) ──────────
+        # ── Patch extraction ──────────────────────────────────────────────────
+        # Use git --no-pager diff HEAD --text — simple and correct.
+        # Do NOT stage untracked files with git add -N:
+        #   that captures node_modules, injected tools (edit_file.py, NOTES.txt),
+        #   and build artifacts, producing multi-MB "patches" the evaluator rejects.
         _, patch = await asyncio.to_thread(
             docker.execute_command,
-            (
-                f"cd {repo_root} && "
-                r"git ls-files --others --exclude-standard "
-                r"| grep -v -E '(__pycache__|\.pyc$|\.egg-info/)' "
-                r"| xargs -r git add -N -- 2>/dev/null || true && "
-                r"git diff HEAD"
-            ),
+            f"cd {repo_root} && git --no-pager diff HEAD --text",
             30,
         )
         logger.info("Patch extracted: %d chars (gate_passed=%s)", len(patch), gate_passed)
 
-        # Write snapshot for timeout recovery
         try:
             with open("/tmp/purple_patch.diff", "w") as pf:
                 pf.write(patch)
