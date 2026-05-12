@@ -107,6 +107,14 @@ class LLMClient:
                 response = await self.client.chat.completions.create(**payload)
                 msg      = response.choices[0].message
 
+                # ── DIAGNOSTIC LOG — remove after one run ──────────────────────
+                logger.info(
+                "RAW MSG: content=%d chars | reasoning_details=%s | model_extra_keys=%s",
+                len(msg.content or ""),
+                str(getattr(msg, "reasoning_details", "ATTR_MISSING"))[:120],
+                list((getattr(msg, "model_extra", {}) or {}).keys()),
+                )
+
                 # ── Extract content ───────────────────────────────────────────
                 content = msg.content or ""
 
