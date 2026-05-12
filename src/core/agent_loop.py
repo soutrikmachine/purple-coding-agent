@@ -12,7 +12,7 @@ Key design decisions:
 import logging
 import asyncio
 import textwrap
-import time  # <-- NEW: Required for the 300s deadline stopwatch
+import time
 from typing import Dict, List, Tuple
 
 from .llm_client import LLMClient
@@ -23,10 +23,10 @@ logger = logging.getLogger(__name__)
 
 import os as _os
 
-MAX_TURNS     = int(_os.getenv("MAX_TURNS",     "14"))
-MAX_OBS_CHARS = int(_os.getenv("MAX_OBS_CHARS", "1500"))
-CONTEXT_KEEP  = int(_os.getenv("CONTEXT_KEEP",  "8"))
-TASK_TIMEOUT_SECONDS = 280  # <-- NEW: Hard cutoff buffer (leaves 20s for graceful exit)
+MAX_TURNS            = int(_os.getenv("MAX_TURNS",     "14"))
+MAX_OBS_CHARS        = int(_os.getenv("MAX_OBS_CHARS", "1500"))
+CONTEXT_KEEP         = int(_os.getenv("CONTEXT_KEEP",  "8"))
+TASK_TIMEOUT_SECONDS = 280  # Hard cutoff buffer — leaves 20s for graceful exit
 
 
 class AgentLoop:
@@ -91,7 +91,6 @@ class AgentLoop:
         """)
 
     def _bootstrap_workspace(self, repo_dir: str):
-        # (Your existing bootstrap code remains exactly the same)
         editor = (
             "import sys\n"
             "f, old, new = sys.argv[1], sys.argv[2], sys.argv[3]\n"
@@ -149,19 +148,20 @@ class AgentLoop:
 
     def _assistant_msg(self, content: str) -> Dict:
         """
-        FIX 1: Captures OpenRouter's new standard 'reasoning' field if 'reasoning_details' 
-        is missing. This ensures MiniMax does not lose its chain of thought.
+        Preserves reasoning for MiniMax continuity across turns.
+        Tries reasoning_details (list, official format) first,
+        falls back to reasoning (string) if that's what was returned.
         """
         msg: Dict = {"role": "assistant", "content": content}
-        
+
         rd = getattr(self.llm, "_last_reasoning_details", None)
         rt = getattr(self.llm, "_last_reasoning", None)
-        
+
         if rd:
             msg["reasoning_details"] = rd
         elif rt:
-            msg["reasoning"] = rt  # The new standard OpenAI formatting payload
-            
+            msg["reasoning"] = rt  # fallback for string-format reasoning
+
         return msg
 
     @staticmethod
@@ -190,7 +190,7 @@ class AgentLoop:
                     pruned.insert(-1, m)
                     logger.debug("Rescued reasoning from pruned context")
                     break
- 
+
         return pruned
 
     async def run_stage_4_bash_repl(
@@ -199,10 +199,10 @@ class AgentLoop:
         context_primer: str,
         verify_cmd: str = "",
     ) -> Tuple[bool, List[Dict]]:
-        
-        # --- NEW: THE GLOBAL STOPWATCH ---
+
+        # Global stopwatch — enforces TASK_TIMEOUT_SECONDS inside the loop
         self.start_time = time.time()
-        
+
         repo_dir = self.docker.repo_dir
         self._bootstrap_workspace(repo_dir)
 
@@ -221,8 +221,9 @@ class AgentLoop:
         tests_run = False
         if verify_cmd and verify_cmd.strip():
             logger.info("Pre-loop: running verify_cmd: %s", verify_cmd[:80])
-            # REDUCED TIMEOUT: We cannot afford 60s on pre-flight if total budget is 300s
-            ec, out = self.docker.execute_command(f"cd {repo_dir} && {verify_cmd}", timeout=25) 
+            ec, out = self.docker.execute_command(
+                f"cd {repo_dir} && {verify_cmd}", timeout=25
+            )
             out_capped = self._cap_observation(out)
             messages.append({
                 "role": "user",
@@ -231,17 +232,27 @@ class AgentLoop:
             tests_run = ec == 0
 
         for turn in range(1, MAX_TURNS + 1):
-            # --- NEW: TIMEOUT ENFORCER ---
+
+            # Per-turn deadline check — force-submit before gateway kills us
             elapsed_time = time.time() - self.start_time
             if elapsed_time > TASK_TIMEOUT_SECONDS:
-                logger.error(f"TIME LIMIT REACHED ({elapsed_time:.1f}s > {TASK_TIMEOUT_SECONDS}s). Force-submitting to save score!")
-                self.docker.execute_command(f"cd {repo_dir} && git diff HEAD > /tmp/purple_patch.diff", timeout=5)
+                logger.error(
+                    "TIME LIMIT REACHED (%.1fs > %ds). Force-submitting.",
+                    elapsed_time, TASK_TIMEOUT_SECONDS,
+                )
+                self.docker.execute_command(
+                    f"cd {repo_dir} && git diff HEAD > /tmp/purple_patch.diff",
+                    timeout=5,
+                )
                 return True, messages
 
             logger.info("--- TURN %d/%d (Elapsed: %.1fs) ---", turn, MAX_TURNS, elapsed_time)
 
             if turn == MAX_TURNS:
-                self.docker.execute_command(f"cd {repo_dir} && git diff HEAD", timeout=10)
+                self.docker.execute_command(
+                    f"cd {repo_dir} && git diff HEAD > /tmp/purple_patch.diff",
+                    timeout=10,
+                )
                 return True, messages
 
             messages = self._prune_context(messages)
@@ -250,18 +261,23 @@ class AgentLoop:
                 raw = await self.llm.generate_step(messages)
             except Exception as e:
                 logger.error("LLM error turn %d: %s", turn, str(e)[:150])
-                messages.append({"role": "user", "content": f"<observation status='FAILED'>LLM error: {str(e)[:100]}</observation>"})
+                messages.append({
+                    "role": "user",
+                    "content": f"<observation status='FAILED'>LLM error: {str(e)[:100]}</observation>",
+                })
                 continue
 
             messages.append(self._assistant_msg(raw))
 
-            # --- FIX: SAFE REASONING WRITE ---
-            # Using heredoc 'EOF' prevents bash from evaluating $variables inside the LLM's thought process.
+            # Write reasoning to NOTES.txt using heredoc — safe against $variables
+            # in the LLM's thought output being evaluated by bash.
             reasoning = getattr(self.llm, "_last_reasoning", "")
             if reasoning and len(reasoning) > 20:
                 summary = reasoning[:300]
                 self.docker.execute_command(
-                    f"cat << 'EOF' >> {repo_dir}/NOTES.txt\n[Turn {turn} thinking]: {summary}...\nEOF\n",
+                    f"cat << 'REASONEOF' >> {repo_dir}/NOTES.txt\n"
+                    f"[Turn {turn} thinking]: {summary}...\n"
+                    f"REASONEOF\n",
                     timeout=5,
                 )
 
@@ -270,9 +286,14 @@ class AgentLoop:
             except Exception:
                 thought, action_type, action_content = "", "bash", "echo 'Parse error.'"
 
+            logger.info("Turn %d | action=%s | content=%s", turn, action_type, action_content[:80])
+
             if action_type == "submit":
                 if turn < 4 and not tests_run:
-                    messages.append({"role": "user", "content": "<observation status='REJECTED'>Run tests first.</observation>"})
+                    messages.append({
+                        "role": "user",
+                        "content": "<observation status='REJECTED'>Run tests first before submitting.</observation>",
+                    })
                     continue
                 return True, messages
 
@@ -281,24 +302,86 @@ class AgentLoop:
                 output_capped = self._cap_observation(out)
                 self._append_to_notes(repo_dir, turn, action_content, out)
 
-                is_test_cmd = any(kw in action_content for kw in ["pytest", "npm test", "go test", "run_script.sh"])
-                if is_test_cmd: tests_run = True
+                is_test_cmd = any(kw in action_content for kw in
+                                  ["pytest", "npm test", "go test", "run_script.sh"])
+                if is_test_cmd:
+                    tests_run = True
 
-                is_edit = any(kw in action_content for kw in ["edit_file.py", "git apply", "patch "])
+                is_edit = any(kw in action_content for kw in
+                              ["edit_file.py", "git apply", "patch "])
                 if is_edit and self.tester.test_command:
-                    # REDUCED TIMEOUT: Protect the 300s budget
                     _, test_out = self.docker.execute_command(
                         f"cd {repo_dir} && timeout 15s {self.tester.test_command} 2>&1 | tail -20",
-                        timeout=20, 
+                        timeout=20,
                     )
                     tests_run = True
-                    messages.append({"role": "user", "content": self.llm.format_observation(output_capped, ec)})
                     messages.append({
                         "role": "user",
-                        "content": f"<observation status='AUTO_TEST'>Auto-test post-edit:\n{self._cap_observation(test_out)}</observation>"
+                        "content": self.llm.format_observation(output_capped, ec),
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"<observation status='AUTO_TEST'>Auto-test post-edit:\n"
+                            f"{self._cap_observation(test_out)}</observation>"
+                        ),
                     })
                     continue
 
-                messages.append({"role": "user", "content": self.llm.format_observation(output_capped, ec)})
+                messages.append({
+                    "role": "user",
+                    "content": self.llm.format_observation(output_capped, ec),
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": f"<observation status='FAILED'>Unknown action '{action_type}'.</observation>",
+                })
 
         return True, messages
+
+    async def run_stage_6_qa_phase(
+        self, messages: List[Dict], max_qa_retries: int = 2
+    ) -> bool:
+        for attempt in range(1, max_qa_retries + 1):
+            logger.info("QA attempt %d/%d", attempt, max_qa_retries)
+            gate_passed, gate_msg = self.tester.verify_patch()
+            if gate_passed:
+                return True
+
+            failing_tests = [
+                l.strip() for l in gate_msg.splitlines()
+                if l.strip().startswith("FAILED ") or l.strip().startswith("--- FAIL:")
+            ]
+            test_list    = "\n".join(failing_tests[:5]) if failing_tests else gate_msg[:500]
+            targeted_cmd = self.tester.test_command or "git diff HEAD"
+
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"GATE FAILED (attempt {attempt}/{max_qa_retries}).\n"
+                    f"Failing:\n{test_list}\n\nRun: `{targeted_cmd}`\nFix and submit."
+                ),
+            })
+
+            for _ in range(3):
+                try:
+                    raw = await self.llm.generate_step(self._prune_context(messages))
+                except Exception as e:
+                    logger.error("QA LLM error: %s", e)
+                    break
+                messages.append(self._assistant_msg(raw))
+                try:
+                    _, atype, acontent = self.llm.parse_response(raw)
+                except Exception:
+                    atype, acontent = "bash", "echo 'parse error'"
+                if atype == "submit":
+                    break
+                if atype == "bash":
+                    ec, out = self.docker.execute_command(acontent)
+                    messages.append({
+                        "role": "user",
+                        "content": self.llm.format_observation(self._cap_observation(out), ec),
+                    })
+
+        return False
