@@ -20,9 +20,9 @@ services:
 
       # ── Agent Loop (all read from env — no rebuild needed to tune) ────────
       - MAX_TURNS=20            # bash REPL turn budget per task
-      - MAX_OBS_CHARS=1500      # observation output cap (chars, head+tail)
+      - MAX_OBS_CHARS=2000      # observation output cap (chars, head+tail)
       - CONTEXT_KEEP=8          # rolling message window (last N messages kept)
-      - TASK_TIMEOUT_S=260      # global asyncio timeout — must be < 300s gateway limit
+      - TASK_TIMEOUT_S=280      # global asyncio timeout — must be < 300s gateway limit
 
       # ── Logging ───────────────────────────────────────────────────────────
       - LOG_LEVEL=INFO

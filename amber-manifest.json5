@@ -35,9 +35,9 @@
       "GITHUB_TOKEN": "${config.github_token}",
       "LLM_BASE_URL": "https://openrouter.ai/api/v1",
       "MODEL_NAME": "minimax/minimax-m2.7",
-      "MAX_TURNS": "30",
+      "MAX_TURNS": "20",
       "TASK_TIMEOUT_S": "280",
-      "MAX_OBS_CHARS": "2500"
+      "MAX_OBS_CHARS": "2000"
     },
 
     "network": {

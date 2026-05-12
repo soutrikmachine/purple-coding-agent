@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 import os as _os
 
-MAX_TURNS            = int(_os.getenv("MAX_TURNS",     "30"))
-MAX_OBS_CHARS        = int(_os.getenv("MAX_OBS_CHARS", "2500"))
+MAX_TURNS            = int(_os.getenv("MAX_TURNS",     "20"))
+MAX_OBS_CHARS        = int(_os.getenv("MAX_OBS_CHARS", "2000"))
 CONTEXT_KEEP         = int(_os.getenv("CONTEXT_KEEP",  "8"))
 TASK_TIMEOUT_SECONDS = 280  # Hard cutoff buffer — leaves 20s for graceful exit
 

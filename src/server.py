@@ -228,9 +228,12 @@ async def _run_task(task_data: dict, llm: LLMClient) -> str:
         # Do NOT stage untracked files with git add -N:
         #   that captures node_modules, injected tools (edit_file.py, NOTES.txt),
         #   and build artifacts, producing multi-MB "patches" the evaluator rejects.
+        # git add -u stages modifications to tracked files only.
+        # This captures what the agent changed without staging untracked files
+        # (node_modules, injected tools, build artifacts) that caused the 6MB bug.
         _, patch = await asyncio.to_thread(
             docker.execute_command,
-            f"cd {repo_root} && git --no-pager diff HEAD --text",
+            f"cd {repo_root} && git add -u && git --no-pager diff HEAD --text",
             30,
         )
         logger.info("Patch extracted: %d chars (gate_passed=%s)", len(patch), gate_passed)
