@@ -94,7 +94,9 @@ class LLMClient:
         # ── FIX 1: OpenRouter Standard Reasoning Flag ──
         if self.is_thinking_model and use_thinking:
             # This is the universal OpenRouter flag to request reasoning tokens
-            payload["include_reasoning"] = True
+            payload["extra_body"] = {
+                "include_reasoning": True
+            }
             
             # We also pass the native formats in extra_body just in case OpenRouter 
             # routes to a raw endpoint that requires it.
