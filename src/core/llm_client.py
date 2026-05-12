@@ -81,21 +81,26 @@ class LLMClient:
           2. HTML/Cloudflare firewall leak detection
           3. Empty response retry with temperature nudge
         """
+        import re
+        
         payload: Dict = {
             "model":       self.model_name,
             "messages":    messages,
             "temperature": temperature,
-            "max_tokens":  4096,   # must exceed thinking budget
+            # INCREASED: Reasoning models need massive token budgets (thinking + output)
+            "max_tokens":  8192,   
         }
 
-        # Inject reasoning — format differs by model family
+        # ── FIX 1: OpenRouter Standard Reasoning Flag ──
         if self.is_thinking_model and use_thinking:
+            # This is the universal OpenRouter flag to request reasoning tokens
+            payload["include_reasoning"] = True
+            
+            # We also pass the native formats in extra_body just in case OpenRouter 
+            # routes to a raw endpoint that requires it.
             if self.is_minimax:
-                # MiniMax uses a simple boolean enable
                 payload["extra_body"] = {"reasoning": {"enabled": True}}
             else:
-                # Gemini 3 and Claude use effort levels (low/medium/high)
-                # "medium" gives meaningful thinking without excessive latency
                 payload["extra_body"] = {"reasoning": {"effort": "medium"}}
 
         # Reset side-channel before call
@@ -107,57 +112,47 @@ class LLMClient:
                 response = await self.client.chat.completions.create(**payload)
                 msg      = response.choices[0].message
 
-                # ── DIAGNOSTIC LOG — remove after one run ──────────────────────
-                logger.info(
-                "RAW MSG: content=%d chars | reasoning_details=%s | model_extra_keys=%s",
-                len(msg.content or ""),
-                str(getattr(msg, "reasoning_details", "ATTR_MISSING"))[:120],
-                list((getattr(msg, "model_extra", {}) or {}).keys()),
-                )
-
                 # ── Extract content ───────────────────────────────────────────
                 content = msg.content or ""
 
-                # ── Extract reasoning_details ─────────────────────────────────
-                # OpenRouter normalises all thinking models to reasoning_details.
-                # MiniMax REQUIRES this to be preserved and passed back in the
-                # next turn's messages list — without it reasoning degrades.
+                # ── FIX 2: Robust Reasoning Extraction ──
                 reasoning_text    = ""
                 reasoning_details = None
+                
                 if self.is_thinking_model:
                     try:
-                        rd = getattr(msg, "reasoning_details", None)
-                        if rd and isinstance(rd, list):
-                            reasoning_details = rd
-                            reasoning_text = " ".join(
-                                item.get("text", "") or item.get("thinking", "")
-                                for item in rd
-                                if isinstance(item, dict)
-                            ).strip()
-                        # Fallbacks for providers that surface it differently
-                        if not reasoning_text:
-                            reasoning_text = getattr(msg, "reasoning", None) or ""
-                        if not reasoning_text:
-                            extra = getattr(msg, "model_extra", {}) or {}
-                            rd2 = extra.get("reasoning_details") or extra.get("reasoning") or ""
-                            if isinstance(rd2, list):
-                                reasoning_details = rd2
-                                reasoning_text = " ".join(
-                                    str(r.get("text", "") or r.get("thinking", ""))
-                                    for r in rd2
-                                )
-                            else:
-                                reasoning_text = str(rd2) if rd2 else ""
+                        # 1. Native OpenAI SDK reasoning field (latest standard)
+                        if hasattr(msg, "reasoning") and msg.reasoning:
+                            reasoning_text = msg.reasoning
+                            
+                        # 2. OpenRouter fallback for older SDKs
+                        if not reasoning_text and hasattr(msg, "model_extra") and msg.model_extra:
+                            reasoning_text = msg.model_extra.get("reasoning", "")
+                            # Capture raw details if Anthropic/OpenRouter passed them through
+                            if "reasoning_details" in msg.model_extra:
+                                reasoning_details = msg.model_extra["reasoning_details"]
+
+                        # 3. DeepSeek/MiniMax in-content fallback (<think> tags)
+                        if not reasoning_text and content and "<think>" in content:
+                            think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL | re.IGNORECASE)
+                            if think_match:
+                                reasoning_text = think_match.group(1).strip()
+                                # Strip it from content so your XML parser doesn't choke on it
+                                content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+                                
                     except Exception as e:
                         logger.debug("reasoning_details extraction error: %s", e)
 
                 self._last_reasoning         = reasoning_text
                 self._last_reasoning_details = reasoning_details
 
-                logger.debug(
-                    "LLM: %d chars content, %d chars reasoning",
-                    len(content), len(reasoning_text)
+                # ── DIAGNOSTIC LOG — Watch this in your terminal ──
+                logger.info(
+                    "LLM Attempt %d: %d chars content | %d chars reasoning",
+                    attempt, len(content), len(reasoning_text)
                 )
+                if reasoning_text:
+                    logger.debug("REASONING PREVIEW: %s...", reasoning_text[:200].replace('\n', ' '))
 
                 # ── Firewall leak detection ────────────────────────────────────
                 if content and (
